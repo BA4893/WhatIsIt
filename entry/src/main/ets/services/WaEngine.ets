@@ -38,6 +38,11 @@ interface WaEngineNative {
   callEnd(callId: string): string;
   callMute(callId: string, muted: boolean): string;
   callCamera(callId: string, on: boolean): string;
+  passkeyRequest(): string;
+  passkeyAssertion(credentialIdB64Url: string, assertionJsonB64Url: string): string;
+  passkeyConfirm(): string;
+  passkeyCancel(): string;
+  mediaPath(id: string, kind: string): string;
 }
 
 /** An engine event forwarded to the app: type + JSON payload. */
@@ -301,6 +306,107 @@ export class WaEngine {
     } catch (err) {
       hilog.warn(DOMAIN, TAG, 'callCamera failed: %{public}s', JSON.stringify(err));
       return Promise.resolve(false);
+    }
+  }
+
+  /** Pending passkey request options JSON ('' when none). */
+  passkeyRequest(): string {
+    const native = this.loadNative();
+    if (native === null) {
+      return '';
+    }
+    try {
+      const raw = native.passkeyRequest();
+      try {
+        const parsed = JSON.parse(raw) as Record<string, Object>;
+        const options = parsed['options'];
+        return typeof options === 'string' ? (options as string) : '';
+      } catch (e) {
+        return '';
+      }
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'passkeyRequest failed: %{public}s', JSON.stringify(err));
+      return '';
+    }
+  }
+
+  /** Resolve the pending passkey ceremony with a WebAuthn assertion. */
+  passkeyAssertion(credentialIdB64Url: string, assertionJsonB64Url: string): Promise<boolean> {
+    const native = this.loadNative();
+    if (native === null) {
+      return Promise.resolve(false);
+    }
+    try {
+      const raw = native.passkeyAssertion(credentialIdB64Url, assertionJsonB64Url);
+      let ok = false;
+      try {
+        const parsed = JSON.parse(raw) as Record<string, Object>;
+        ok = parsed['ok'] === true;
+      } catch (e) {
+        ok = raw === 'true';
+      }
+      return Promise.resolve(ok);
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'passkeyAssertion failed: %{public}s', JSON.stringify(err));
+      return Promise.resolve(false);
+    }
+  }
+
+  /** Confirm the verification code on a fresh link. */
+  passkeyConfirm(): Promise<boolean> {
+    const native = this.loadNative();
+    if (native === null) {
+      return Promise.resolve(false);
+    }
+    try {
+      const raw = native.passkeyConfirm();
+      let ok = false;
+      try {
+        const parsed = JSON.parse(raw) as Record<string, Object>;
+        ok = parsed['ok'] === true;
+      } catch (e) {
+        ok = raw === 'true';
+      }
+      return Promise.resolve(ok);
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'passkeyConfirm failed: %{public}s', JSON.stringify(err));
+      return Promise.resolve(false);
+    }
+  }
+
+  /** Cancel the pending passkey ceremony. */
+  passkeyCancel(): Promise<boolean> {
+    const native = this.loadNative();
+    if (native === null) {
+      return Promise.resolve(false);
+    }
+    try {
+      const raw = native.passkeyCancel();
+      let ok = false;
+      try {
+        const parsed = JSON.parse(raw) as Record<string, Object>;
+        ok = parsed['ok'] === true;
+      } catch (e) {
+        ok = raw === 'true';
+      }
+      return Promise.resolve(ok);
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'passkeyCancel failed: %{public}s', JSON.stringify(err));
+      return Promise.resolve(false);
+    }
+  }
+
+  /** Absolute path of a cached media file ('' when not cached yet). */
+  mediaPath(id: string, kind: string): string {
+    const native = this.loadNative();
+    if (native === null) {
+      return '';
+    }
+    try {
+      return native.mediaPath(id, kind);
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'mediaPath failed: %{public}s', JSON.stringify(err));
+      return '';
     }
   }
 }

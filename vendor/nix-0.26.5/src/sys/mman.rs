@@ -59,7 +59,7 @@ libc_bitflags! {
         /// Put the mapping into the first 2GB of the process address space.
         #[cfg(any(all(any(target_os = "android", target_os = "linux"),
                       any(target_arch = "x86", target_arch = "x86_64")),
-                  all(target_os = "linux", target_env = "musl", any(target_arch = "x86", target_arch = "x86_64")),
+                  all(target_os = "linux", any(target_env = "musl", target_env = "ohos"), any(target_arch = "x86", target_arch = "x86_64")),
                   all(target_os = "freebsd", target_pointer_width = "64")))]
         #[cfg_attr(docsrs, doc(cfg(all())))]
         MAP_32BIT;

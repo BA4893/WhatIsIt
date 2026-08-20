@@ -185,6 +185,19 @@ export class CdpBridge {
       evt.chat = typeof parsed['chat'] === 'string' ? (parsed['chat'] as string) : '';
     } else if (type === 'pair_code') {
       evt.code = typeof parsed['code'] === 'string' ? (parsed['code'] as string) : '';
+    } else if (type === 'passkey_request') {
+      evt.options = typeof parsed['options'] === 'string' ? (parsed['options'] as string) : '';
+    } else if (type === 'passkey_confirmation') {
+      evt.code = typeof parsed['code'] === 'string' ? (parsed['code'] as string) : '';
+    } else if (type === 'passkey_error') {
+      evt.error = typeof parsed['error'] === 'string' ? (parsed['error'] as string) : '';
+    } else if (type === 'incoming_call') {
+      evt.callId = typeof parsed['callId'] === 'string' ? (parsed['callId'] as string) : '';
+      evt.from = typeof parsed['from'] === 'string' ? (parsed['from'] as string) : '';
+      evt.video = parsed['video'] === true;
+    } else if (type === 'call_state') {
+      evt.callId = typeof parsed['callId'] === 'string' ? (parsed['callId'] as string) : '';
+      evt.state = typeof parsed['state'] === 'string' ? (parsed['state'] as string) : '';
     }
     return evt;
   }
@@ -576,6 +589,9 @@ export class CdpBridge {
 
   /** Get the pending passkey request options JSON ("" if none). */
   async passkeyRequest(): Promise<string> {
+    if (waEngine.isReady()) {
+      return waEngine.passkeyRequest();
+    }
     const resp = await this.httpJson('GET', '/passkey/request');
     if (resp === null) {
       return '';
@@ -589,6 +605,9 @@ export class CdpBridge {
    * credentialId / assertionJson are base64url (no padding).
    */
   async passkeyAssertion(credentialIdB64Url: string, assertionJsonB64Url: string): Promise<boolean> {
+    if (waEngine.isReady()) {
+      return waEngine.passkeyAssertion(credentialIdB64Url, assertionJsonB64Url);
+    }
     const body = JSON.stringify({
       credentialId: credentialIdB64Url,
       assertionJson: assertionJsonB64Url,
@@ -599,12 +618,18 @@ export class CdpBridge {
 
   /** Confirm the verification code shown on the phone (fresh link). */
   async passkeyConfirm(): Promise<boolean> {
+    if (waEngine.isReady()) {
+      return waEngine.passkeyConfirm();
+    }
     const resp = await this.httpJson('POST', '/passkey/confirm');
     return resp !== null;
   }
 
   /** Cancel the pending passkey ceremony (user backed out). */
   async passkeyCancel(): Promise<boolean> {
+    if (waEngine.isReady()) {
+      return waEngine.passkeyCancel();
+    }
     const resp = await this.httpJson('POST', '/passkey/cancel');
     return resp !== null;
   }

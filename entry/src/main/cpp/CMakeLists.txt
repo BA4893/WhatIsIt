@@ -22,13 +22,18 @@ include_directories(${NATIVERENDER_ROOT_PATH}
 # wa_bridge.cpp exposes it to ArkTS; it is only compiled+linked once the Rust
 # .so exists, so the app keeps building without it.
 set(WA_ENGINE_LIB "${CMAKE_CURRENT_SOURCE_DIR}/../../../../engine/target/aarch64-unknown-linux-ohos/release/libwa_engine.so")
-if(EXISTS "${WA_ENGINE_LIB}")
+if(EXISTS "${WA_ENGINE_LIB}" AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     add_library(call_media SHARED
         video_encoder.cpp
         video_decoder.cpp
         napi_init.cpp
         wa_bridge.cpp)
     target_link_libraries(call_media PUBLIC ${WA_ENGINE_LIB})
+    # The engine .so is not a CMake target, so copy it next to libcall_media.so
+    # after the build; the HAP packager collects every .so in that dir.
+    add_custom_command(TARGET call_media POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${WA_ENGINE_LIB}" "$<TARGET_FILE_DIR:call_media>/libwa_engine.so")
 else()
     add_library(call_media SHARED
         video_encoder.cpp

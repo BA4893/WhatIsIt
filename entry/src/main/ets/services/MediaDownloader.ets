@@ -12,6 +12,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { common } from '@kit.AbilityKit';
 import { util } from '@kit.ArkTS';
 import { cdpBridge } from './CdpBridge';
+import { waEngine } from './WaEngine';
 
 const TAG = 'MediaDownloader';
 const DOMAIN = 0x0000;
@@ -40,6 +41,17 @@ export class MediaDownloader {
     if (this.cacheDir.length === 0) {
       hilog.warn(DOMAIN, TAG, 'download: cacheDir not initialized');
       return '';
+    }
+    // Embedded engine: media was cached locally when the message arrived;
+    // resolve /media/{id}/{kind} straight from the engine's sandbox store.
+    if (waEngine.isReady() && !url.startsWith('http')) {
+      const parts = url.split('/');
+      if (parts.length >= 3 && parts[1] === 'media') {
+        const engPath = waEngine.mediaPath(parts[2], parts[3]);
+        if (engPath.length > 0 && fileIo.accessSync(engPath)) {
+          return 'file://' + engPath;
+        }
+      }
     }
     // Backend media URLs are relative (/media/{id}/{kind}); resolve them
     // against the backend base URL.

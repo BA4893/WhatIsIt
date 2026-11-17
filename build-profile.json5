@@ -3,26 +3,25 @@
     "signingConfigs": [
       {
         "name": "default",
-        "type": "OpenHarmony",
         "material": {
-          "certpath": "/Users/abhi/.ohos/config/app-debug.cer",
-          "keyAlias": "openharmony application ca",
-          "keyPassword": "00000016bb5ec27737a55e6943e484efe625c9059066b8f3d584fd089cb22d9b4804dc614fbc",
-          "profile": "/Users/abhi/.ohos/config/default_WhatIsIt.p7b",
+          "storePassword": "000000203378777184B53C103497648F5D0EB68BEEE3F45D44100F64AD73C9D9AFB0F7C52702C6311FAD168601BE4650",
+          "certpath": "/storage/Users/currentUser/.ohos/config/default_WhatIsIt-mainD7KGuhvpCnhV8K9BOmQRUe3Is28eX0WkqzF5L5vUAco.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "000000203378777184B53C103497648F5D0EB68BEEE3F45D44100F64AD73C9D9AFB0F7C52702C6311FAD168601BE4650",
+          "profile": "/storage/Users/currentUser/.ohos/config/default_WhatIsIt-mainD7KGuhvpCnhV8K9BOmQRUe3Is28eX0WkqzF5L5vUAco.p7b",
           "signAlg": "SHA256withECDSA",
-          "storeFile": "/Users/abhi/.ohos/config/OpenHarmony.p12",
-          "storePassword": "00000016d2285a26d1fa7dd96ec68cbb7b9a08fa73292b44f23bfe9934733f4f3b04d4078127"
-        }
+          "storeFile": "/storage/Users/currentUser/.ohos/config/default_WhatIsIt-mainD7KGuhvpCnhV8K9BOmQRUe3Is28eX0WkqzF5L5vUAco.p12"
+        },
+        "type": "HarmonyOS"
       }
     ],
     "products": [
       {
         "name": "default",
         "signingConfig": "default",
-        "compileSdkVersion": 23,
-        "targetSdkVersion": 23,
-        "compatibleSdkVersion": 23,
-        "runtimeOS": "OpenHarmony",
+        "targetSdkVersion": "26.0.0",
+        "compatibleSdkVersion": "26.0.0",
+        "runtimeOS": "HarmonyOS",
         "buildOption": {
           "strictMode": {
             "caseSensitiveCheck": true,

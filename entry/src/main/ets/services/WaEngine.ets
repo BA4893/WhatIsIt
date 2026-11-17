@@ -77,9 +77,13 @@ export class WaEngine {
       return;
     }
     try {
-      native.start(dataDir);
-      this.started = true;
+      const rc = native.start(dataDir);
+      this.started = rc === 0;
+      if (rc !== 0) {
+        hilog.warn(DOMAIN, TAG, 'engine start returned %{public}d', rc);
+      }
     } catch (err) {
+      this.started = false;
       hilog.warn(DOMAIN, TAG, 'engine start failed: %{public}s', JSON.stringify(err));
     }
   }

@@ -1,0 +1,155 @@
+name: Packaging
+
+on:
+  push:
+    branches: [main, master]
+    paths: [native-packages.yaml, packaging/**, contrib/omarchy/**, .github/workflows/packaging.yml, .github/workflows/release.yml]
+  pull_request:
+    paths: [native-packages.yaml, packaging/**, contrib/omarchy/**, .github/workflows/packaging.yml, .github/workflows/release.yml]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published version (empty tests the published v0.13.1 fixture)
+        type: string
+        default: ''
+      publish:
+        description: Attach packages and run enabled downstream publishers
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      publish:
+        type: boolean
+        default: true
+    secrets:
+      AUR_SSH_KEY:
+        required: false
+      AUR_KNOWN_HOSTS:
+        required: false
+      HOMEBREW_TAP_GITHUB_TOKEN:
+        required: false
+      HOMEBREW_TAP_SSH_KEY:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  packaging:
+    permissions:
+      contents: write
+    uses: crmne/native-packages/.github/workflows/package.yml@25a4214d2f203357c84b069f39de7c17c0be6253 # v0.11.0
+    with:
+      targets: linux-amd64,linux-arm64
+      version: ${{ inputs.version || 'v0.13.1' }}
+      publish: ${{ inputs.publish == true && inputs.version != '' }}
+    secrets: inherit
+
+  # The Windows package, installed for real with stand-in program files: an
+  # Inno Setup install as 0.20.1 and earlier made, the MSI taking it over, an
+  # update, and uninstalling with ZapFast running and without. Releases ship
+  # only the MSI; the Inno script stays to make the old install to take over.
+  windows-installer:
+    name: Windows installer
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '4.0'
+      - name: WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add --global WixToolset.Util.wixext/5.0.2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Install, update and remove
+        shell: pwsh
+        run: pwsh packaging/windows/test-installer.ps1
+      # The release's own path to the package: native-packages checks the
+      # input's executable is an x64 PE file, so a system one stands in.
+      - name: Package as the release does
+        shell: pwsh
+        run: |
+          gem install native-packages --version 0.11.0 --no-document
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $payload = "dist\windows-input-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Force $payload | Out-Null
+          Copy-Item "$env:SystemRoot\System32\PING.EXE" "$payload\zapfast.exe"
+          Copy-Item README.md, LICENSE, THIRD-PARTY-NOTICES.md, packaging\windows\zapfast-installer.txt $payload
+          native-packages build --version 0.0.1 --target windows-amd64 `
+            --defer-recipes --output "$env:RUNNER_TEMP\windows-packages"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem "$env:RUNNER_TEMP\windows-packages\packages\windows-amd64\msi\zapfast-v0.0.1-x86_64-pc-windows-msvc.msi"
+
+  installation:
+    name: Install (${{ matrix.os }}, ${{ matrix.image }})
+    needs: packaging
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        # The oldest distributions the releases support (built in Debian 12,
+        # glibc 2.36) and newer. The v0.13.1 fixture that runs without a
+        # version needs glibc 2.39, so Debian 12 is tested on real releases.
+        image: ${{ fromJSON(inputs.version && '["debian:12-slim", "ubuntu:24.04", "debian:13-slim", "fedora:41", "fedora:latest"]' || '["ubuntu:24.04", "debian:13-slim", "fedora:41", "fedora:latest"]') }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-packages
+          path: dist/native-packages
+      - name: Install and check runtime libraries in a clean container
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: bash packaging/test-install.sh "$IMAGE" dist/native-packages
+
+  # The AppImage carries no libraries of its own, so the runner supplies
+  # ALSA as a desktop would. Runners have no FUSE: it unpacks itself to run.
+  appimage:
+    name: AppImage (${{ matrix.os }})
+    needs: packaging
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-amd64
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+            arch: aarch64
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-packages
+          path: dist/native-packages
+      - name: Run the AppImage
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2t64 libpipewire-0.3-0t64
+          set -- dist/native-packages/packages/"$TARGET"/appimage/zapfast-*-"$ARCH".AppImage
+          test "$#" -eq 1
+          chmod +x "$1"
+          "$1" --appimage-extract-and-run --version | grep -Ex '(zapfast|fastsapp) [0-9]+\.[0-9]+\.[0-9]+.*'
+
+  user-installer:
+    name: User installer
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install a source build into a prefix with spaces and a percent
+        run: bash packaging/test-install-user.sh

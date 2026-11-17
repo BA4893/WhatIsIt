@@ -1,0 +1,2991 @@
+//! Shared avatars, fields, menus, and badges.
+
+use std::path::Path;
+
+use egui::{
+    Align, Color32, CornerRadius, Layout, Rect, Sense, Stroke, Ui, UiBuilder, Vec2, pos2, vec2,
+};
+
+use crate::bidi;
+use crate::emoji;
+use crate::model::Delivery;
+use crate::theme::{self, Icon, Palette};
+
+/// Laid-out text and its color emoji placements.
+pub struct Line {
+    pub galley: std::sync::Arc<egui::Galley>,
+    placements: Vec<String>,
+    accessible_text: String,
+}
+
+impl Line {
+    pub fn size(&self) -> Vec2 {
+        self.galley.size()
+    }
+
+    pub fn paint(&self, ui: &Ui, pos: egui::Pos2, fallback: Color32) {
+        let response = ui.interact(
+            Rect::from_min_size(pos, self.size()),
+            ui.id()
+                .with(("painted-text", pos.x.to_bits(), pos.y.to_bits())),
+            Sense::hover(),
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Label,
+                ui.is_enabled(),
+                &self.accessible_text,
+            )
+        });
+        ui.painter().galley(pos, self.galley.clone(), fallback);
+        emoji::paint(ui, &self.galley, pos, &self.placements);
+    }
+}
+
+/// Lays out text within `width` and `max_rows`, with an ellipsis and color emoji.
+pub fn line(
+    ui: &Ui,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+    width: f32,
+    max_rows: usize,
+) -> Line {
+    let single = text.lines().next().unwrap_or_default();
+    if max_rows == 1 && single.chars().any(bidi::is_strong_rtl) {
+        return rtl_line(ui, text, single, font, color, width);
+    }
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = width;
+    job.wrap.max_rows = max_rows;
+    // Break anywhere for single-line ellipsis; wrap multi-line text at words.
+    job.wrap.break_anywhere = max_rows == 1;
+    job.wrap.overflow_character = Some('…');
+    let mut placements = Vec::new();
+    let format = egui::TextFormat::simple(font, color);
+    emoji::append(
+        ui,
+        &mut job,
+        &mut placements,
+        if max_rows == 1 { single } else { text },
+        &format,
+    );
+    let galley = bidi::layout_job(ui, job);
+    Line {
+        galley,
+        placements,
+        accessible_text: text.to_owned(),
+    }
+}
+
+/// One line of text holding right-to-left script, cut to `width` by its
+/// logical end. egui cuts a line in the order it lays glyphs out, which for
+/// Arabic and Hebrew is already the visual one, so its ellipsis replaced a
+/// letter mid-line and the reordered line overflowed its width (#72). The
+/// longest start of the text that fits beside an ellipsis is laid out
+/// whole instead, so the ellipsis ends the text as a reader expects.
+fn rtl_line(
+    ui: &Ui,
+    text: &str,
+    single: &str,
+    font: egui::FontId,
+    color: Color32,
+    width: f32,
+) -> Line {
+    let format = egui::TextFormat::simple(font, color);
+    let layout = |shown: &str| {
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = f32::INFINITY;
+        job.wrap.max_rows = 1;
+        let mut placements = Vec::new();
+        emoji::append(ui, &mut job, &mut placements, shown, &format);
+        (bidi::layout_job(ui, job), placements)
+    };
+    let (mut galley, mut placements) = layout(single);
+    if galley.size().x > width {
+        let ends: Vec<usize> = single
+            .char_indices()
+            .map(|(at, _)| at)
+            .skip(1)
+            .chain(std::iter::once(single.len()))
+            .collect();
+        // Longest prefix, in characters, that fits with the ellipsis.
+        let (mut low, mut high) = (0, ends.len());
+        let mut best = layout("…");
+        while low < high {
+            let middle = (low + high).div_ceil(2);
+            let shown = format!("{}…", single[..ends[middle - 1]].trim_end());
+            let candidate = layout(&shown);
+            if candidate.0.size().x <= width {
+                best = candidate;
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        (galley, placements) = best;
+    }
+    Line {
+        galley,
+        placements,
+        accessible_text: text.to_owned(),
+    }
+}
+
+/// How long a [`scrolling_text`] rests at each end before it moves.
+const SCROLL_REST: f64 = 3.0;
+/// The average speed of a [`scrolling_text`] crossing, in points a second.
+const SCROLL_SPEED: f64 = 40.0;
+/// How wide the faded edge of a [`scrolling_text`] is where the text is cut.
+const SCROLL_FADE: f32 = 24.0;
+
+/// Where a line `overflow` points wider than its room is `elapsed` seconds
+/// after it appeared: how far it has moved left, and how long until it next
+/// needs repainting. It rests at its start, eases across to its end, rests
+/// there, and eases back, over and over.
+fn scroll_offset(elapsed: f64, overflow: f32) -> (f32, Option<std::time::Duration>) {
+    if overflow <= 0.0 {
+        return (0.0, None);
+    }
+    let travel = f64::from(overflow) / SCROLL_SPEED;
+    let cycle = 2.0 * (SCROLL_REST + travel);
+    let phase = elapsed.max(0.0) % cycle;
+    let crossing = |at: f64| {
+        let t = (at / travel).clamp(0.0, 1.0);
+        // Smoothstep: starts and stops gently, as fast as SCROLL_SPEED on average.
+        (t * t * (3.0 - 2.0 * t)) as f32 * overflow
+    };
+    let rest = |left: f64| Some(std::time::Duration::from_secs_f64(left));
+    if phase < SCROLL_REST {
+        (0.0, rest(SCROLL_REST - phase))
+    } else if phase < SCROLL_REST + travel {
+        (
+            crossing(phase - SCROLL_REST),
+            Some(std::time::Duration::ZERO),
+        )
+    } else if phase < 2.0 * SCROLL_REST + travel {
+        (overflow, rest(2.0 * SCROLL_REST + travel - phase))
+    } else {
+        let back = phase - 2.0 * SCROLL_REST - travel;
+        (overflow - crossing(back), Some(std::time::Duration::ZERO))
+    }
+}
+
+/// One line of text with color emoji that never leaves the room it is
+/// given. Text too wide for it scrolls from end to end, resting at each,
+/// and fades into `background` wherever it is cut instead of ending in an
+/// ellipsis. Right-to-left text starts at its right edge, where it begins.
+pub fn scrolling_text(
+    ui: &mut Ui,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+    background: Color32,
+) -> egui::Response {
+    let width = ui.available_width().max(1.0);
+    let line = line(ui, text, font, color, f32::INFINITY, 1);
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(line.size().x.min(width), line.size().y),
+        Sense::hover(),
+    );
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), text));
+    let overflow = line.size().x - rect.width();
+    // The clock starts when this text shows here, and again whenever it was
+    // missing from the previous pass (the view closed, or the text changed).
+    let id = response.id.with(text);
+    let now = ui.input(|input| input.time);
+    let pass = ui.ctx().cumulative_pass_nr();
+    let since = ui.ctx().data_mut(|data| {
+        let (since, seen) = data.get_temp_mut_or(id, (now, pass));
+        if *seen + 1 < pass {
+            *since = now;
+        }
+        *seen = pass;
+        *since
+    });
+    let (travelled, repaint) = scroll_offset(now - since, overflow);
+    // How much of the line is hidden past the left edge.
+    let offset = if bidi::base_rtl(text.lines().next().unwrap_or_default()) {
+        overflow.max(0.0) - travelled
+    } else {
+        travelled
+    };
+    if let Some(after) = repaint {
+        // Decorative: stepped while a screen reader is attached.
+        crate::motion::request_frame_after(ui.ctx(), after);
+    }
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let mut clipped = ui.new_child(UiBuilder::new().max_rect(rect));
+    clipped.set_clip_rect(rect.intersect(ui.clip_rect()));
+    let origin = pos2(rect.left() - offset, rect.top());
+    clipped.painter().galley(origin, line.galley.clone(), color);
+    emoji::paint(&clipped, &line.galley, origin, &line.placements);
+    // Each edge fades in as the text starts to run past it.
+    let fade = SCROLL_FADE.min(rect.width() / 3.0);
+    let strength = |hidden: f32| (hidden / fade).clamp(0.0, 1.0);
+    if offset > 0.0 {
+        fade_left(
+            &clipped,
+            rect,
+            fade,
+            background.gamma_multiply(strength(offset)),
+        );
+    }
+    if overflow - offset > 0.0 {
+        fade_right(
+            &clipped,
+            rect,
+            fade,
+            background.gamma_multiply(strength(overflow - offset)),
+        );
+    }
+    response
+}
+
+/// Allocates one truncated line with color emoji.
+pub fn rich_text(ui: &mut Ui, text: &str, font: egui::FontId, color: Color32) -> egui::Response {
+    let width = ui.available_width().max(1.0);
+    let line = line(ui, text, font, color, width, 1);
+    let (rect, response) = ui.allocate_exact_size(line.size(), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        line.paint(ui, rect.min, color);
+    }
+    response
+}
+
+/// Selectable version of [`rich_text`].
+pub fn selectable_rich_text(
+    ui: &mut Ui,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+) -> egui::Response {
+    let width = ui.available_width().max(1.0);
+    let line = line(ui, text, font, color, width, 1);
+    let (rect, response) = ui.allocate_exact_size(line.size(), Sense::CLICK | Sense::DRAG);
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), text));
+    // Register emoji placements so copied text restores the original sequences.
+    if let Some(rows) = ui.ctx().data(|data| {
+        data.get_temp::<std::sync::Arc<std::sync::Mutex<Vec<crate::transcript::Row>>>>(
+            egui::Id::new("copy-rows"),
+        )
+    }) {
+        rows.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(crate::transcript::Row {
+                header: String::new(),
+                body: line.galley.text().to_owned(),
+                placements: line.placements.clone(),
+                ..Default::default()
+            });
+    }
+    if ui.is_rect_visible(rect) {
+        egui::text_selection::LabelSelectionState::label_text_selection(
+            ui,
+            &response,
+            rect.min,
+            line.galley.clone(),
+            color,
+            egui::Stroke::NONE,
+        );
+        crate::emoji::paint(ui, &line.galley, rect.min, &line.placements);
+    }
+    response
+}
+
+/// An image for a local file, registered so egui's caches for it can be
+/// released once it leaves the screen.
+pub fn file_image(ui: &Ui, path: &Path) -> egui::Image<'static> {
+    let uri = crate::util::image_uri(path);
+    crate::image_cache::touch(ui.ctx(), &uri);
+    egui::Image::new(uri)
+}
+
+/// Round profile picture, or id-colored initials when no picture is available.
+pub fn avatar(
+    ui: &mut Ui,
+    palette: &Palette,
+    name: &str,
+    id: &str,
+    size: f32,
+    picture: Option<&Path>,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        paint_avatar(ui, palette, rect, name, id, picture);
+    }
+    response
+}
+
+/// An avatar that acts as a button. It must be created clickable: first
+/// creating it for hover and then calling `interact` registers the same id
+/// twice, and the unfocusable first registration makes egui drop keyboard
+/// focus from it on every frame.
+pub fn clickable_avatar(
+    ui: &mut Ui,
+    palette: &Palette,
+    name: &str,
+    id: &str,
+    size: f32,
+    picture: Option<&Path>,
+    label: &str,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
+    theme::reveal_focus(&response);
+    theme::focus_outline(ui, response.id, rect, size / 2.0);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    if ui.is_rect_visible(rect) {
+        paint_avatar(ui, palette, rect, name, id, picture);
+    }
+    response
+}
+
+pub fn paint_avatar(
+    ui: &Ui,
+    palette: &Palette,
+    rect: Rect,
+    name: &str,
+    id: &str,
+    picture: Option<&Path>,
+) {
+    let size = rect.width();
+    let mut painted = false;
+    if let Some(picture) = picture {
+        let image = file_image(ui, picture)
+            .fit_to_exact_size(Vec2::splat(size))
+            .corner_radius(size / 2.0);
+        if let Ok(egui::load::TexturePoll::Ready { .. }) =
+            image.load_for_size(ui.ctx(), Vec2::splat(size))
+        {
+            image.paint_at(ui, rect);
+            painted = true;
+        }
+    }
+    if !painted {
+        let fill = palette.avatar(crate::util::hue(id));
+        ui.painter().circle_filled(rect.center(), size / 2.0, fill);
+        if crate::model::ChatKind::from_id(id) == crate::model::ChatKind::Group {
+            theme::paint_icon(ui, Icon::Users, rect, size * 0.5, Color32::WHITE);
+        } else {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                crate::util::initials(name),
+                theme::semibold(size * 0.38),
+                Color32::WHITE,
+            );
+        }
+    }
+}
+
+pub fn paint_disappearing_badge(ui: &Ui, palette: &Palette, avatar: Rect) {
+    let size = (avatar.width() * 0.38).clamp(14.0, 18.0);
+    let rect = Rect::from_center_size(
+        pos2(avatar.right() - size * 0.15, avatar.bottom() - size * 0.15),
+        Vec2::splat(size),
+    );
+    ui.painter()
+        .circle_filled(rect.center(), size * 0.58, palette.surface);
+    theme::paint_icon(ui, Icon::Timer, rect, size, palette.accent);
+}
+
+/// Outgoing-message status ticks.
+pub fn ticks(ui: &Ui, palette: &Palette, rect: Rect, status: Delivery) {
+    ticks_in(ui, palette, rect, status, palette.secondary);
+}
+
+/// Status ticks with `plain` for the states that are not read or failed,
+/// for ticks drawn over a picture.
+pub fn ticks_in(ui: &Ui, palette: &Palette, rect: Rect, status: Delivery, plain: Color32) {
+    let Some(icon) = tick_icon(status) else {
+        return;
+    };
+    let color = match status {
+        Delivery::Read | Delivery::Played => palette.read,
+        Delivery::Failed => palette.danger,
+        _ => plain,
+    };
+    theme::paint_icon(ui, icon, rect, rect.height(), color);
+}
+
+/// The glyph for a delivery state: our own ticks, both as tall as each
+/// other, as people know them from their phone.
+pub fn tick_icon(status: Delivery) -> Option<Icon> {
+    Some(match status {
+        Delivery::None => return None,
+        Delivery::Pending => Icon::Clock,
+        Delivery::Sent => Icon::DeliveryTick,
+        Delivery::Delivered | Delivery::Read | Delivery::Played => Icon::DeliveryTicks,
+        Delivery::Failed => Icon::CircleAlert,
+    })
+}
+
+/// Chat-row unread badge.
+pub fn badge(ui: &Ui, palette: &Palette, at: egui::Pos2, count: u32, muted: bool) -> f32 {
+    let label = if count > 99 {
+        "99+".to_owned()
+    } else {
+        count.to_string()
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label, theme::semibold(11.0), palette.on_accent);
+    let width = (galley.size().x + 12.0).max(20.0);
+    let rect = Rect::from_center_size(at, vec2(width, 20.0));
+    let fill = if muted { palette.dim } else { palette.accent };
+    ui.painter().rect_filled(rect, 10.0, fill);
+    ui.painter().galley(
+        rect.center() - galley.size() / 2.0,
+        galley,
+        palette.on_accent,
+    );
+    width
+}
+
+/// "@" in the round of a count badge: an unread message mentions us.
+pub fn mention_badge(ui: &Ui, palette: &Palette, at: egui::Pos2) -> f32 {
+    let galley =
+        ui.painter()
+            .layout_no_wrap("@".to_owned(), theme::semibold(12.0), palette.on_accent);
+    let rect = Rect::from_center_size(at, vec2(20.0, 20.0));
+    ui.painter()
+        .circle_filled(rect.center(), 10.0, palette.accent);
+    ui.painter().galley(
+        rect.center() - galley.size() / 2.0,
+        galley,
+        palette.on_accent,
+    );
+    20.0
+}
+
+/// Empty unread reminder: the same round as a count badge, with no digit.
+pub fn unread_dot(ui: &Ui, palette: &Palette, at: egui::Pos2, muted: bool) -> f32 {
+    let fill = if muted { palette.dim } else { palette.accent };
+    ui.painter().circle_filled(at, 5.0, fill);
+    10.0
+}
+
+/// The unread mark beside a chat: a numbered badge while messages are pending,
+/// an empty dot for a chat marked unread by hand, nothing otherwise.
+pub fn unread_indicator(
+    ui: &Ui,
+    palette: &Palette,
+    at: egui::Pos2,
+    count: u32,
+    marked: bool,
+    muted: bool,
+) -> f32 {
+    if count > 0 {
+        badge(ui, palette, at, count, muted)
+    } else if marked {
+        unread_dot(ui, palette, at, muted)
+    } else {
+        0.0
+    }
+}
+
+/// The height of a dialog's scrolling body: it grows with the content until
+/// the whole dialog takes the window's height less a margin, up to a cap, and
+/// then scrolls. Poll results set the measure; give the scroll area this as
+/// both its maximum and its minimum scrolled height, so a modal does not
+/// shrink it to the space below its first, smaller position.
+pub fn dialog_scroll_height(ui: &Ui) -> f32 {
+    // What the dialog has laid out above the scroll area: its title, and
+    // anything else that stays in place.
+    let above = (ui.cursor().top() - ui.min_rect().top()).max(0.0);
+    (ui.ctx().content_rect().height() - 158.0 - above)
+        .min(592.0 - above)
+        .max(100.0)
+}
+
+/// Minimum width needed for menu labels.
+pub fn menu_width(ui: &Ui, labels: &[&str], icons: bool) -> f32 {
+    let widest = labels
+        .iter()
+        .map(|label| {
+            ui.painter()
+                .layout_no_wrap(label.to_string(), theme::regular(13.5), Color32::WHITE)
+                .size()
+                .x
+        })
+        .fold(0.0, f32::max);
+    // Text padding, then `menu_frame`'s margin and its 1-point stroke on each
+    // side: without the stroke the widest label lost its last letters.
+    widest + if icons { 26.0 } else { 0.0 } + 20.0 + MENU_FRAME_EXTRA
+}
+
+/// What `menu_frame` adds to a menu's width: its 6-point margin and its
+/// 1-point stroke, on each side.
+const MENU_FRAME_EXTRA: f32 = 2.0 * (6.0 + 1.0);
+
+/// The room a submenu leaves between itself and the window's edges.
+const SUBMENU_WINDOW_GAP: f32 = 8.0;
+
+/// The width of a submenu's rows: as wide as the widest of `items`, but
+/// never wider than the window, where a long label (a custom sound's file
+/// name) ends in an ellipsis instead of running off screen.
+fn submenu_width(ui: &Ui, items: &[&str]) -> f32 {
+    // `menu_width` counts `menu_frame`'s margin and stroke, and the submenu
+    // brings its own frame around the rows.
+    let fit = menu_width(ui, items, true) - MENU_FRAME_EXTRA;
+    let room = ui.ctx().content_rect().width() - MENU_FRAME_EXTRA - 2.0 * SUBMENU_WINDOW_GAP;
+    fit.min(room.max(0.0))
+}
+
+/// A context-menu entry that opens a submenu, drawn like the plain entries
+/// beside it, with a chevron. The submenu is as wide as the widest of
+/// `items`, its rows' labels: otherwise its rows take egui's whole
+/// `menu_width` and leave a wide blank strip after their text.
+pub fn submenu<R>(
+    ui: &mut Ui,
+    palette: &Palette,
+    icon: Icon,
+    label: &str,
+    items: &[&str],
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> Option<egui::InnerResponse<R>> {
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click());
+    theme::reveal_focus(&response);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    note_menu_row(ui, response.id, label);
+    let open = egui::Popup::is_id_open(
+        ui.ctx(),
+        egui::containers::menu::SubMenu::id_from_widget_id(response.id),
+    );
+    if ui.is_rect_visible(rect) {
+        if response.hovered() || open {
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(6), palette.surface_hover);
+        }
+        let icon_rect =
+            Rect::from_center_size(pos2(rect.left() + 18.0, rect.center().y), Vec2::splat(16.0));
+        icon.image(palette.secondary, 16.0).paint_at(ui, icon_rect);
+        let chevron = Rect::from_center_size(
+            pos2(rect.right() - 16.0, rect.center().y),
+            Vec2::splat(14.0),
+        );
+        Icon::ChevronRight
+            .image(palette.secondary, 14.0)
+            .paint_at(ui, chevron);
+        let x = rect.left() + 36.0;
+        let mut job = egui::text::LayoutJob::simple_singleline(
+            label.to_string(),
+            theme::regular(13.5),
+            palette.text,
+        );
+        job.wrap = egui::text::TextWrapping {
+            max_width: (chevron.left() - 6.0 - x).max(0.0),
+            max_rows: 1,
+            break_anywhere: true,
+            overflow_character: Some('\u{2026}'),
+        };
+        let galley = crate::bidi::layout_job(ui, job);
+        ui.painter().galley(
+            pos2(x, rect.center().y - galley.size().y / 2.0),
+            galley,
+            palette.text,
+        );
+    }
+    let width = submenu_width(ui, items);
+    egui::containers::menu::SubMenu::new().show(ui, &response, |ui| {
+        ui.set_width(width);
+        add_contents(ui)
+    })
+}
+
+pub fn menu_item(ui: &mut Ui, palette: &Palette, icon: Option<Icon>, label: &str) -> bool {
+    menu_item_enabled(ui, palette, icon, label, true)
+}
+
+pub fn menu_item_enabled(
+    ui: &mut Ui,
+    palette: &Palette,
+    icon: Option<Icon>,
+    label: &str,
+    enabled: bool,
+) -> bool {
+    // Drawn either way: a disabled item still shows, greyed out.
+    let response = menu_item_response(ui, palette, icon, label, enabled);
+    enabled && response.clicked()
+}
+
+/// A menu item as [`menu_item_enabled`] draws it, returning its response,
+/// for a menu that needs the item's id (to focus it from the keyboard).
+pub fn menu_item_response(
+    ui: &mut Ui,
+    palette: &Palette,
+    icon: Option<Icon>,
+    label: &str,
+    enabled: bool,
+) -> egui::Response {
+    menu_item_named(ui, palette, icon, label, label, enabled)
+}
+
+/// As [`menu_item_response`], with a screen reader name that differs from the
+/// visible `label`, for a row whose unavailability needs explaining.
+pub fn menu_item_named(
+    ui: &mut Ui,
+    palette: &Palette,
+    icon: Option<Icon>,
+    label: &str,
+    accessible: &str,
+    enabled: bool,
+) -> egui::Response {
+    menu_item_focusable(ui, palette, icon, label, accessible, enabled, enabled)
+}
+
+/// [`menu_item_named`] whose row can take focus even when disabled, for a
+/// menu opened to read one: the screen reader then says it is unavailable,
+/// and why, from its name.
+pub fn menu_item_focusable(
+    ui: &mut Ui,
+    palette: &Palette,
+    icon: Option<Icon>,
+    label: &str,
+    accessible: &str,
+    enabled: bool,
+    focusable: bool,
+) -> egui::Response {
+    let width = ui.available_width();
+    // A disabled row still takes the click, so it does not reach a widget
+    // under the menu; `Sense::CLICK` is not focusable, so Tab skips it.
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(width, 28.0),
+        if focusable {
+            Sense::click()
+        } else {
+            Sense::CLICK
+        },
+    );
+    theme::reveal_focus(&response);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            enabled && ui.is_enabled(),
+            accessible,
+        )
+    });
+    if focusable {
+        note_menu_row(ui, response.id, label);
+    }
+    if ui.is_rect_visible(rect) {
+        if response.hovered() && enabled {
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(6), palette.surface_hover);
+        }
+        let color = if enabled { palette.text } else { palette.dim };
+        let mut x = rect.left() + 10.0;
+        if let Some(icon) = icon {
+            let icon_rect =
+                Rect::from_center_size(pos2(x + 8.0, rect.center().y), Vec2::splat(16.0));
+            icon.image(
+                if enabled {
+                    palette.secondary
+                } else {
+                    palette.dim
+                },
+                16.0,
+            )
+            .paint_at(ui, icon_rect);
+            x += 26.0;
+        }
+        let mut job = egui::text::LayoutJob::simple_singleline(
+            label.to_string(),
+            theme::regular(13.5),
+            color,
+        );
+        job.wrap = egui::text::TextWrapping {
+            max_width: (rect.right() - 10.0 - x).max(0.0),
+            max_rows: 1,
+            break_anywhere: true,
+            overflow_character: Some('\u{2026}'),
+        };
+        let galley = crate::bidi::layout_job(ui, job);
+        ui.painter().galley(
+            pos2(x, rect.center().y - galley.size().y / 2.0),
+            galley,
+            color,
+        );
+    }
+    if enabled && response.clicked() {
+        ui.close();
+    }
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
+/// A menu row that takes focus, as letter navigation knows it.
+#[derive(Clone)]
+struct MenuRow {
+    layer: egui::LayerId,
+    id: egui::Id,
+    /// The letter its label starts with, folded as [`fold_letter`] folds.
+    letter: Option<char>,
+}
+
+/// The rows that take focus in the menus drawn so far in this pass, in the
+/// order they were drawn, which is the order Tab and the arrows walk them,
+/// and those of the pass before.
+#[derive(Clone, Default)]
+struct MenuRows {
+    pass: u64,
+    rows: Vec<MenuRow>,
+    before: (u64, Vec<MenuRow>),
+}
+
+fn menu_rows_id() -> egui::Id {
+    egui::Id::new("menu-rows")
+}
+
+/// Notes a menu row that takes focus, for [`menu_letters`].
+fn note_menu_row(ui: &Ui, id: egui::Id, label: &str) {
+    // A popup's first pass only measures it: nothing in it takes focus yet.
+    if ui.is_sizing_pass() || !ui.is_enabled() {
+        return;
+    }
+    let pass = ui.ctx().cumulative_pass_nr();
+    let row = MenuRow {
+        layer: ui.layer_id(),
+        id,
+        letter: first_letter(label),
+    };
+    ui.ctx().data_mut(|data| {
+        let rows = data.get_temp_mut_or_default::<MenuRows>(menu_rows_id());
+        if rows.pass != pass {
+            rows.before = (rows.pass, std::mem::take(&mut rows.rows));
+            rows.pass = pass;
+        }
+        rows.rows.push(row);
+    });
+}
+
+/// The menu rows drawn in the pass before this one: the menus as they are
+/// on screen while this pass reads its input.
+fn last_menu_rows(ctx: &egui::Context) -> Vec<MenuRow> {
+    let Some(before) = ctx.cumulative_pass_nr().checked_sub(1) else {
+        return Vec::new();
+    };
+    ctx.data(|data| data.get_temp::<MenuRows>(menu_rows_id()))
+        .map(|rows| {
+            if rows.pass == before {
+                rows.rows
+            } else if rows.before.0 == before {
+                rows.before.1
+            } else {
+                Vec::new()
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// The letter a label is found by: its first letter or digit, past any
+/// emoji, quote, symbol or direction mark before it.
+fn first_letter(label: &str) -> Option<char> {
+    label
+        .chars()
+        .find(|letter| letter.is_alphanumeric())
+        .map(fold_letter)
+}
+
+/// A letter as letter navigation compares it: in lower case, and an alef
+/// with a hamza or madda as the plain alef, the key most layouts type it
+/// with.
+fn fold_letter(letter: char) -> char {
+    match letter {
+        '\u{623}' | '\u{625}' | '\u{622}' | '\u{671}' => '\u{627}',
+        _ => letter.to_lowercase().next().unwrap_or(letter),
+    }
+}
+
+/// Moves through the menu that has keyboard focus by letter, as a desktop
+/// menu does: each typed character moves focus to the next row whose label
+/// starts with it, from the focused row on, wrapping at the end, so the
+/// same letter again goes on to the next such row. The row is not chosen:
+/// Enter or Space chooses it. A row Tab and the arrows skip, such as a
+/// disabled one, is skipped here too.
+///
+/// It reads what was typed, not which keys were pressed, so it follows any
+/// keyboard layout, Arabic too. While a menu row has focus, what is typed
+/// goes to no one else, nor do the keys that typed it, so a letter never
+/// reaches a shortcut such as the message list's R or the message field.
+/// Space, which presses the focused row, is left alone. Called first thing
+/// in a frame, before anything else reads its keys.
+pub fn menu_letters(ctx: &egui::Context) {
+    if !egui::Popup::is_any_open(ctx) {
+        return;
+    }
+    let Some(focused) = ctx.memory(|memory| memory.focused()) else {
+        return;
+    };
+    let rows = last_menu_rows(ctx);
+    let Some(layer) = rows
+        .iter()
+        .find(|row| row.id == focused)
+        .map(|row| row.layer)
+    else {
+        return;
+    };
+    let typed = ctx.input_mut(take_typed);
+    let rows: Vec<&MenuRow> = rows.iter().filter(|row| row.layer == layer).collect();
+    let letters: Vec<Option<char>> = rows.iter().map(|row| row.letter).collect();
+    let mut at = rows.iter().position(|row| row.id == focused);
+    for letter in typed {
+        if let Some(found) = next_with_letter(&letters, at, letter) {
+            at = Some(found);
+        }
+    }
+    if let Some(row) = at.and_then(|at| rows.get(at))
+        && row.id != focused
+    {
+        ctx.memory_mut(|memory| memory.request_focus(row.id));
+        // Moving by letter is keyboard navigation, as the arrows are.
+        ctx.data_mut(|data| data.insert_temp(theme::keyboard_focus_id(), true));
+    }
+}
+
+/// Takes this frame's typed text, apart from spaces, and with it the
+/// presses that typed it: those of a key that types a character, with no
+/// Ctrl, Command or Alt held.
+fn take_typed(input: &mut egui::InputState) -> Vec<char> {
+    let mut typed = Vec::new();
+    input.events.retain(|event| match event {
+        egui::Event::Text(text) if !text.trim().is_empty() => {
+            typed.extend(text.chars().filter(|letter| !letter.is_whitespace()));
+            false
+        }
+        _ => true,
+    });
+    if !typed.is_empty() {
+        input.events.retain(|event| {
+            !matches!(
+                event,
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if types_a_character(*key)
+                    && !(modifiers.ctrl || modifiers.command || modifiers.mac_cmd || modifiers.alt)
+            )
+        });
+    }
+    typed
+}
+
+/// Whether `key` stands for a character: a letter, a digit or a sign, not
+/// an arrow, Space, Enter or a function key.
+fn types_a_character(key: egui::Key) -> bool {
+    use egui::Key;
+    !matches!(
+        key,
+        Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp
+    ) && key.symbol_or_name().chars().count() == 1
+}
+
+/// The index of the next of `letters` after `from` (from the start when
+/// None) that is `typed`, wrapping; `from` itself when it is the only one.
+/// None when no row starts with it.
+fn next_with_letter(letters: &[Option<char>], from: Option<usize>, typed: char) -> Option<usize> {
+    if !typed.is_alphanumeric() {
+        return None;
+    }
+    let typed = fold_letter(typed);
+    let start = from.map_or(0, |from| from + 1);
+    (0..letters.len())
+        .map(|step| (start + step) % letters.len())
+        .find(|&index| letters[index] == Some(typed))
+}
+
+pub fn menu_separator(ui: &mut Ui, palette: &Palette) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 9.0), Sense::hover());
+    ui.painter().hline(
+        rect.x_range().shrink(6.0),
+        rect.center().y,
+        Stroke::new(1.0, palette.outline),
+    );
+}
+
+/// Shows `frame` raised like a message bubble: the same soft lift shadow
+/// below it and the faint raised edge along its top, for surfaces that sit
+/// on the chat (the composer, and the strips above it).
+pub fn raised<R>(
+    ui: &mut Ui,
+    palette: &Palette,
+    frame: egui::Frame,
+    add: impl FnOnce(&mut Ui) -> R,
+) -> egui::InnerResponse<R> {
+    // Reserved before the frame paints, so the edge lies under its fill.
+    let edge_at = ui.painter().add(egui::Shape::Noop);
+    let (fill, radius) = (frame.fill, frame.corner_radius);
+    let shown = frame.shadow(palette.bubble_shadow()).show(ui, add);
+    ui.painter().set(
+        edge_at,
+        egui::Shape::rect_filled(
+            shown
+                .response
+                .rect
+                .translate(vec2(0.0, -theme::RAISED_EDGE)),
+            radius,
+            palette.raised_edge(fill),
+        ),
+    );
+    shown
+}
+
+/// Shared popup-menu frame.
+pub fn menu_frame(palette: &Palette) -> egui::Frame {
+    egui::Frame::new()
+        .fill(palette.overlay)
+        .stroke(Stroke::new(1.0, palette.outline))
+        .corner_radius(CornerRadius::same(theme::RADIUS))
+        .inner_margin(egui::Margin::same(6))
+        .shadow(palette.float_shadow())
+}
+
+pub fn empty_state(ui: &mut Ui, palette: &Palette, icon: Icon, title: &str, body: &str) {
+    ui.add_space(48.0);
+    ui.vertical_centered(|ui| {
+        theme::icon(ui, icon, 40.0, palette.dim);
+        ui.add_space(8.0);
+        theme::text(ui, title, theme::semibold(16.0), palette.text);
+        ui.add_space(2.0);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(body)
+                    .font(theme::regular(13.5))
+                    .color(palette.secondary),
+            )
+            .wrap()
+            .selectable(false),
+        );
+    });
+}
+
+/// Where the ink of `galley`'s first row centres, from its top: halfway
+/// between its first glyph's top and its second's bottom. Laid out from "Hy",
+/// that is the span from a capital's top to a descender's bottom, which reads
+/// as centred whatever mix of letters a line holds. `None` when either glyph
+/// has no ink.
+pub fn ink_middle(galley: &egui::Galley) -> Option<f32> {
+    let row = galley.rows.first()?;
+    let [capital, descender] = [row.glyphs.first()?, row.glyphs.get(1)?];
+    let top = capital.pos.y + capital.uv_rect.offset.y;
+    let bottom = descender.pos.y + descender.uv_rect.offset.y + descender.uv_rect.size.y;
+    (!capital.uv_rect.is_nothing() && !descender.uv_rect.is_nothing())
+        .then(|| row.pos.y + (top + bottom) / 2.0)
+}
+
+/// Where a capital's ink centres in `galley`'s first row, from its top:
+/// halfway between the top and the bottom of its first glyph, laid out from
+/// "H", which stands on the baseline. `None` when the glyph has no ink.
+pub fn cap_middle(galley: &egui::Galley) -> Option<f32> {
+    let row = galley.rows.first()?;
+    let capital = row.glyphs.first()?;
+    let top = capital.pos.y + capital.uv_rect.offset.y;
+    let bottom = top + capital.uv_rect.size.y;
+    (!capital.uv_rect.is_nothing()).then(|| row.pos.y + (top + bottom) / 2.0)
+}
+
+/// Where a search field's text was laid out last frame, for layout tests.
+pub fn search_galley_id(field: egui::Id) -> egui::Id {
+    field.with("galley")
+}
+
+/// Search field with icon and clear button.
+pub fn search_field(
+    ui: &mut Ui,
+    palette: &Palette,
+    id: egui::Id,
+    text: &mut String,
+    hint: &str,
+    width: f32,
+) -> egui::Response {
+    let height = 34.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+    let has_focus = ui.memory(|memory| memory.has_focus(id));
+    // Over a vibrant window's material, a tint that lets it show through.
+    let fill = match (palette.vibrant(), has_focus) {
+        (true, false) => palette.tint(theme::TINT_FIELD),
+        (true, true) => palette.tint(theme::TINT_FIELD + theme::TINT_HOVER),
+        (false, true) => palette.surface_hover,
+        (false, false) => palette.surface,
+    };
+    ui.painter().rect_filled(rect, height / 2.0, fill);
+    let icon_rect =
+        Rect::from_center_size(pos2(rect.left() + 18.0, rect.center().y), Vec2::splat(16.0));
+    Icon::Search
+        .image(palette.secondary, 16.0)
+        .paint_at(ui, icon_rect);
+    let format = egui::TextFormat::simple(theme::regular(14.0), palette.text);
+    // A capital, from its top to the baseline, centres on the icons, which
+    // is where a word reads as centred. Centring the line box left the
+    // platform font's text a point or two below the magnifier, since its box
+    // has more room above the capitals than below the descenders; centring
+    // capitals and descenders together lifted a word without descenders, the
+    // usual case, above it.
+    let probe = bidi::layout_field(ui, "H", &format, f32::INFINITY);
+    let line_height = probe.size().y;
+    let middle = cap_middle(&probe).unwrap_or(line_height / 2.0);
+    let top = fastframe_text::snap_to_pixels(rect.center().y - middle, ui.ctx().pixels_per_point());
+    let field_rect = Rect::from_min_max(
+        pos2(rect.left() + 34.0, top),
+        pos2(rect.right() - 30.0, top + line_height),
+    );
+    // The editor is one line tall now; the rest of the pill still focuses
+    // it, as it did when the editor filled the pill. Registered first, so
+    // the editor and the clear button win their own clicks. Not a tab
+    // stop of its own: the editor is.
+    let pill = ui
+        .interact(rect, id.with("pill"), Sense::CLICK)
+        .on_hover_cursor(egui::CursorIcon::Text);
+    if pill.clicked() {
+        ui.memory_mut(|memory| memory.request_focus(id));
+    }
+    let mut child = ui.new_child(
+        UiBuilder::new()
+            .max_rect(field_rect)
+            .layout(Layout::left_to_right(Align::Min)),
+    );
+    let mut layouter = |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, wrap: f32| {
+        bidi::layout_field(ui, buffer.as_str(), &format, wrap)
+    };
+    let align = if bidi::base_rtl(text) {
+        Align::RIGHT
+    } else {
+        Align::LEFT
+    };
+    let output = egui::TextEdit::singleline(text)
+        .id(id)
+        .hint_text(
+            egui::RichText::new(hint)
+                .color(palette.dim)
+                .font(theme::regular(14.0)),
+        )
+        .font(theme::regular(14.0))
+        .text_color(palette.text)
+        .frame(egui::Frame::NONE)
+        .margin(egui::Margin::ZERO)
+        .desired_width(field_rect.width())
+        .horizontal_align(align)
+        .layouter(&mut layouter)
+        .show(&mut child);
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(
+            search_galley_id(id),
+            Rect::from_min_size(output.galley_pos, output.galley.size()),
+        );
+    });
+    let response = output.response.response;
+    theme::focus_outline(ui, response.id, rect, height / 2.0);
+    ui.ctx()
+        .accesskit_node_builder(response.id, |node| node.set_label(hint));
+    if !text.is_empty() {
+        // The button's own size: a smaller box let it overflow downwards,
+        // which put the cross below the field's middle.
+        let clear_rect = Rect::from_center_size(
+            pos2(rect.right() - 17.0, rect.center().y),
+            Vec2::splat(15.0 + theme::ICON_BUTTON_PAD),
+        );
+        let mut clear = ui.new_child(
+            UiBuilder::new()
+                .max_rect(clear_rect)
+                .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
+        );
+        if theme::icon_button(
+            &mut clear,
+            Icon::X,
+            15.0,
+            palette.secondary,
+            palette.text,
+            "Clear",
+        )
+        .clicked()
+        {
+            text.clear();
+            ui.memory_mut(|memory| memory.request_focus(id));
+        }
+    }
+    response
+}
+
+/// Switch control.
+/// Switch that shows its state by shape as well as colour: off is an
+/// outlined track with a small grey knob, on a filled track with a larger
+/// white knob carrying a check (WCAG 1.4.1).
+pub fn switch(ui: &mut Ui, palette: &Palette, on: &mut bool) -> egui::Response {
+    let size = vec2(40.0, 22.0);
+    let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    if ui.is_rect_visible(rect) {
+        let t = ui.ctx().animate_bool(response.id, *on);
+        let fill = egui::lerp(
+            egui::Rgba::from(palette.surface_active)..=egui::Rgba::from(palette.accent),
+            t,
+        );
+        let radius = rect.height() / 2.0;
+        ui.painter().rect_filled(rect, radius, Color32::from(fill));
+        // The outline keeps the off track visible on a light panel.
+        if t < 1.0 {
+            ui.painter().rect_stroke(
+                rect,
+                radius,
+                Stroke::new(1.5, palette.secondary.gamma_multiply(1.0 - t)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let center = pos2(
+            egui::lerp(rect.left() + 11.0..=rect.right() - 11.0, t),
+            rect.center().y,
+        );
+        let knob = egui::lerp(
+            egui::Rgba::from(palette.secondary)..=egui::Rgba::from(Color32::WHITE),
+            t,
+        );
+        ui.painter()
+            .circle_filled(center, egui::lerp(6.0..=8.0, t), Color32::from(knob));
+        if t > 0.5 {
+            let check = Rect::from_center_size(center, Vec2::splat(12.0));
+            Icon::Check
+                .image(palette.accent.gamma_multiply((t - 0.5) * 2.0), 12.0)
+                .paint_at(ui, check);
+        }
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The author's website, linked from the credit line.
+pub const AUTHOR_URL: &str = "https://paolino.me";
+
+/// "Built with love by Carmine Paolino", with the name linking to
+/// [`AUTHOR_URL`]. Returns whether the name was clicked.
+pub fn credit(ui: &mut Ui, palette: &Palette, locale: crate::i18n::Locale) -> bool {
+    // Translators: {name} is replaced by the author's name, shown as a link.
+    let sentence = crate::i18n::gettext(locale, "Built with love by {name}");
+    let (before, after) = sentence.split_once("{name}").unwrap_or((&sentence, ""));
+    let mut clicked = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        theme::text(ui, "\u{2665}  ", theme::regular(13.0), palette.danger);
+        theme::text(ui, before, theme::regular(13.0), palette.secondary);
+        clicked = theme::link(ui, "Carmine Paolino", theme::medium(13.0), palette.link)
+            .on_hover_text(AUTHOR_URL)
+            .clicked();
+        if !after.is_empty() {
+            theme::text(ui, after, theme::regular(13.0), palette.secondary);
+        }
+    });
+    clicked
+}
+
+/// Labeled settings row.
+pub fn setting_row(
+    ui: &mut Ui,
+    palette: &Palette,
+    label: &str,
+    description: &str,
+    control: impl FnOnce(&mut Ui),
+) {
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width((ui.available_width() - 260.0).max(120.0));
+            rich_text(ui, label, theme::medium(14.0), palette.text);
+            if !description.is_empty() {
+                let description = line(
+                    ui,
+                    description,
+                    theme::regular(12.5),
+                    palette.secondary,
+                    ui.available_width(),
+                    usize::MAX,
+                );
+                let (rect, _) = ui.allocate_exact_size(description.size(), Sense::hover());
+                if ui.is_rect_visible(rect) {
+                    description.paint(ui, rect.min, palette.secondary);
+                }
+            }
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), control);
+    });
+    ui.add_space(10.0);
+}
+
+pub fn paint_vertical_gradient(ui: &Ui, rect: Rect, top: Color32, bottom: Color32) {
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(rect.left_top(), top);
+    mesh.colored_vertex(rect.right_top(), top);
+    mesh.colored_vertex(rect.right_bottom(), bottom);
+    mesh.colored_vertex(rect.left_bottom(), bottom);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    ui.painter().add(egui::Shape::mesh(mesh));
+}
+
+/// The hover or selection behind a chat-list row: a rounded card inset from
+/// the list's edges rather than a full-width band.
+pub fn row_highlight(ui: &Ui, palette: &Palette, rect: Rect, color: Color32) {
+    highlight_card(ui, palette, rect.shrink2(vec2(8.0, 2.0)), color);
+}
+
+/// The card `row_highlight` paints, over `card` itself: the rail's lit and
+/// hovered plates look as the selected and hovered chat rows do.
+pub fn highlight_card(ui: &Ui, palette: &Palette, card: Rect, color: Color32) {
+    let radius = CornerRadius::same(theme::RADIUS + 2);
+    // Over a vibrant window's material, a flat tint: the selected row
+    // stronger than the one under the pointer.
+    if palette.vibrant() {
+        let strength = if color == palette.surface_active {
+            theme::TINT_SELECTED
+        } else {
+            theme::TINT_HOVER
+        };
+        ui.painter()
+            .rect_filled(card, radius, palette.tint(strength));
+        return;
+    }
+    // Raised like a message bubble, only more gently: the list sits on a
+    // flat panel, and a hovered row should not jump out.
+    let mut shadow = palette.bubble_shadow();
+    shadow.color = shadow.color.gamma_multiply(0.6);
+    ui.painter().add(shadow.as_shape(card, radius));
+    ui.painter().rect_filled(
+        card.translate(vec2(0.0, -theme::RAISED_EDGE)),
+        radius,
+        palette.raised_edge(color),
+    );
+    ui.painter().rect_filled(card, radius, color);
+}
+
+/// A round check box for a picking list, as WhatsApp draws one: an outlined
+/// circle in the secondary text colour, the accent with a white check once
+/// picked. It takes no room in the layout, so it can sit on top of its row.
+/// Returns whether it was clicked (never while disabled).
+pub fn round_check(
+    ui: &Ui,
+    palette: &Palette,
+    rect: Rect,
+    key: &str,
+    checked: bool,
+    enabled: bool,
+    label: &str,
+) -> bool {
+    let id = ui.id().with(("round-check", key));
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let response = ui.interact(rect, id, sense);
+    theme::reveal_focus(&response);
+    theme::focus_outline(ui, id, rect.expand(3.0), rect.width() / 2.0 + 3.0);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, checked, label)
+    });
+    if ui.is_rect_visible(rect) {
+        let radius = rect.width() / 2.0 - 1.0;
+        if checked {
+            ui.painter()
+                .circle_filled(rect.center(), radius, palette.accent);
+            theme::paint_icon(ui, Icon::Check, rect, rect.width() * 0.7, Color32::WHITE);
+        } else {
+            let color = if enabled && response.hovered() {
+                palette.text
+            } else {
+                palette.secondary
+            };
+            ui.painter()
+                .circle_stroke(rect.center(), radius - 0.75, egui::Stroke::new(1.5, color));
+        }
+    }
+    enabled
+        && response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+}
+
+/// The hover behind a row in a dialog's list: flat, since the dialog itself
+/// already floats, with a bubble's corners. It stops two points short of the
+/// row above and below, leaving four between neighbours; at the sides it
+/// keeps the row's width, so the avatars sit four points inside it.
+pub fn dialog_row_highlight(ui: &Ui, rect: Rect, color: Color32) {
+    ui.painter().rect_filled(
+        rect.shrink2(vec2(0.0, 2.0)),
+        CornerRadius::same(BUBBLE_RADIUS),
+        color,
+    );
+}
+
+/// Fades the rightmost `width` points of `rect` into `color`, over content
+/// that scrolls on past the edge. One gradient quad.
+pub fn fade_right(ui: &Ui, rect: Rect, width: f32, color: Color32) {
+    let fade = Rect::from_min_max(pos2(rect.right() - width, rect.top()), rect.max);
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(fade.left_top(), Color32::TRANSPARENT);
+    mesh.colored_vertex(fade.right_top(), color);
+    mesh.colored_vertex(fade.right_bottom(), color);
+    mesh.colored_vertex(fade.left_bottom(), Color32::TRANSPARENT);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    ui.painter().add(egui::Shape::mesh(mesh));
+}
+
+/// Fades the leftmost `width` points of `rect` into `color`; the mirror of
+/// [`fade_right`].
+pub fn fade_left(ui: &Ui, rect: Rect, width: f32, color: Color32) {
+    let fade = Rect::from_min_max(rect.min, pos2(rect.left() + width, rect.bottom()));
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(fade.left_top(), color);
+    mesh.colored_vertex(fade.right_top(), Color32::TRANSPARENT);
+    mesh.colored_vertex(fade.right_bottom(), Color32::TRANSPARENT);
+    mesh.colored_vertex(fade.left_bottom(), color);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    ui.painter().add(egui::Shape::mesh(mesh));
+}
+
+/// Fades the topmost `height` points of `rect` into `color`, for a column
+/// that scrolls on above.
+pub fn fade_top(ui: &Ui, rect: Rect, height: f32, color: Color32) {
+    let fade = Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + height));
+    vertical_fade(ui, fade, color, Color32::TRANSPARENT);
+}
+
+/// Fades the bottom `height` points of `rect` into `color`; the mirror of
+/// [`fade_top`].
+pub fn fade_bottom(ui: &Ui, rect: Rect, height: f32, color: Color32) {
+    let fade = Rect::from_min_max(pos2(rect.left(), rect.bottom() - height), rect.max);
+    vertical_fade(ui, fade, Color32::TRANSPARENT, color);
+}
+
+/// Fills `rect` with a gradient from `top` to `bottom`.
+fn vertical_fade(ui: &Ui, rect: Rect, top: Color32, bottom: Color32) {
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(rect.left_top(), top);
+    mesh.colored_vertex(rect.right_top(), top);
+    mesh.colored_vertex(rect.right_bottom(), bottom);
+    mesh.colored_vertex(rect.left_bottom(), bottom);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    ui.painter().add(egui::Shape::mesh(mesh));
+}
+
+/// A horizontal row of chips that scrolls when it overflows. It draws no
+/// scroll bar, which has no room of its own and would lie over the chips: the
+/// clipped chip and the edge's fade say there is more. A plain mouse wheel
+/// scrolls the row, since most mice have no sideways wheel.
+pub fn chip_scroll_row<R>(
+    ui: &mut Ui,
+    id_salt: &str,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> egui::scroll_area::ScrollAreaOutput<R> {
+    ui.scope(|ui| {
+        ui.style_mut().always_scroll_the_only_direction = true;
+        crate::ui::bounce::ScrollArea::horizontal()
+            .id_salt(id_salt)
+            .animated(false)
+            .auto_shrink([false, true])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .show(ui, add_contents)
+    })
+    .inner
+}
+
+/// How far the shadow of a bar or panel reaches over the content beside it.
+const SHADOW_REACH: f32 = 9.0;
+
+/// A soft shadow cast downward from `edge`, for a bar that content scrolls
+/// under, beneath a hairline in the palette's outline colour. One gradient
+/// quad.
+pub fn paint_shadow_below(ui: &Ui, palette: &Palette, left: f32, right: f32, edge: f32) {
+    ui.painter().rect_filled(
+        Rect::from_min_max(pos2(left, edge - 1.0), pos2(right, edge)),
+        0.0,
+        palette.outline,
+    );
+    let rect = Rect::from_min_max(pos2(left, edge), pos2(right, edge + SHADOW_REACH));
+    ui.painter()
+        .add(shadow_mesh(palette, rect, [true, true, false, false]));
+}
+
+/// The hairline down the right edge of a panel beside content, in the
+/// palette's outline colour and inside the panel, as the one along a bar's
+/// bottom is. A stroke centred on the edge would lose the half the content
+/// beside it paints over, and all but vanish at some display scales.
+pub fn paint_edge_beside(ui: &Ui, palette: &Palette, panel: Rect) {
+    ui.painter().rect_filled(
+        Rect::from_min_max(
+            pos2(panel.right() - 1.0, panel.top()),
+            pos2(panel.right(), panel.bottom()),
+        ),
+        0.0,
+        palette.outline,
+    );
+}
+
+/// The same shadow cast to the right of `edge`, from `top` to `bottom`: for
+/// a panel beside content on a lower level, as the chat list is beside the
+/// conversation. The panel draws its own hairline.
+pub fn paint_shadow_beside(ui: &Ui, palette: &Palette, edge: f32, top: f32, bottom: f32) {
+    let rect = Rect::from_min_max(pos2(edge, top), pos2(edge + SHADOW_REACH, bottom));
+    ui.painter()
+        .add(shadow_mesh(palette, rect, [true, false, false, true]));
+}
+
+/// One gradient quad over `rect`, dark at the corners marked in `dark`
+/// (left top, right top, right bottom, left bottom) and clear at the others.
+fn shadow_mesh(palette: &Palette, rect: Rect, dark: [bool; 4]) -> egui::Shape {
+    let shade = palette.lift_shadow().gamma_multiply(0.64);
+    let mut mesh = egui::Mesh::default();
+    let corners = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+    ];
+    for (corner, dark) in corners.into_iter().zip(dark) {
+        mesh.colored_vertex(corner, if dark { shade } else { Color32::TRANSPARENT });
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    egui::Shape::mesh(mesh)
+}
+
+/// The side a message bubble's tail points to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Left,
+    Right,
+}
+
+/// Corner radius of a message bubble.
+pub const BUBBLE_RADIUS: u8 = 10;
+/// How far a bubble's tail reaches out from its side, and down from its top.
+pub const TAIL_WIDTH: f32 = 8.0;
+const TAIL_HEIGHT: f32 = 11.0;
+
+/// The corners of a message bubble: the one its tail leaves is square.
+pub fn bubble_corners(tail: Option<Side>) -> CornerRadius {
+    let mut corners = CornerRadius::same(BUBBLE_RADIUS);
+    match tail {
+        Some(Side::Left) => corners.nw = 0,
+        Some(Side::Right) => corners.ne = 0,
+        None => {}
+    }
+    corners
+}
+
+/// A message bubble's backdrop: its soft shadow, its fill, and on the first
+/// message of a run a small tail at the top corner toward the sender, as the
+/// phone draws it. A handful of vertices; bubbles off screen are culled
+/// before tessellation. `pixels_per_point` sets the soft edge the Messages
+/// style draws for itself, and `screen` is the span of the view the bubble
+/// scrolls in, down which Messages shades your own balloons; WhatsApp's
+/// style ignores both.
+pub fn bubble_shape(
+    palette: &Palette,
+    rect: Rect,
+    fill: Color32,
+    tail: Option<Side>,
+    pixels_per_point: f32,
+    screen: egui::Rangef,
+) -> egui::Shape {
+    if palette.bubbles == theme::BubbleStyle::Messages {
+        // Your own balloons run from the palette's colour at the top of the
+        // view to a deeper one at its bottom, as ChatKit's dynamic gradient
+        // does; incoming ones are flat.
+        let gradient = palette
+            .bubble_out_gradient()
+            .filter(|_| fill == palette.bubble_out);
+        let color = |point: egui::Pos2| match gradient {
+            Some((top, bottom)) if screen.span() > 0.0 => top.lerp_to_gamma(
+                bottom,
+                ((point.y - screen.min) / screen.span()).clamp(0.0, 1.0),
+            ),
+            _ => fill,
+        };
+        let outline = messages_balloon(rect, tail, MESSAGES_SCALE);
+        return egui::Shape::mesh(fill_outline(&outline, color, 1.0 / pixels_per_point));
+    }
+    let corners = bubble_corners(tail);
+    let shadow = palette.bubble_shadow();
+    let mut shapes = vec![egui::Shape::Rect(shadow.as_shape(rect, corners))];
+    // The tail overlaps the bubble by a few points so no seam shows where
+    // the two anti-aliased edges meet.
+    let tail_points = tail.map(|side| {
+        let (edge, out, into): (f32, f32, f32) = match side {
+            Side::Left => (rect.left(), -TAIL_WIDTH, 3.0),
+            Side::Right => (rect.right(), TAIL_WIDTH, -3.0),
+        };
+        let top = rect.top();
+        let reach = TAIL_HEIGHT * (TAIL_WIDTH + into.abs()) / TAIL_WIDTH;
+        let mut points = vec![
+            pos2(edge + into, top),
+            pos2(edge + into, top + reach),
+            pos2(edge + out, top),
+        ];
+        // Clockwise winding either way.
+        if side == Side::Right {
+            points.reverse();
+        }
+        points
+    });
+    if let Some(points) = &tail_points {
+        let offset = vec2(shadow.offset[0].into(), shadow.offset[1].into());
+        let points: Vec<_> = points.iter().map(|point| *point + offset).collect();
+        shapes.push(soft_triangle(&points, shadow.color, shadow.blur.into()));
+    }
+    // The raised edge: the same outline a hair higher, under the fill, so
+    // only its top shows, thinning out down the rounded corners.
+    let edge = palette.raised_edge(fill);
+    let lift = vec2(0.0, -theme::RAISED_EDGE);
+    shapes.push(egui::Shape::rect_filled(
+        rect.translate(lift),
+        corners,
+        edge,
+    ));
+    if let Some(points) = &tail_points {
+        shapes.push(egui::Shape::convex_polygon(
+            points.iter().map(|point| *point + lift).collect(),
+            edge,
+            Stroke::NONE,
+        ));
+    }
+    shapes.push(egui::Shape::rect_filled(rect, corners, fill));
+    if let Some(points) = tail_points {
+        shapes.push(egui::Shape::convex_polygon(points, fill, Stroke::NONE));
+    }
+    egui::Shape::Vec(shapes)
+}
+
+/// The text size Messages lays its balloons out for on the Mac: ChatKit's
+/// `CKUIBehaviorMac.balloonTextFont` is the 13 pt system font.
+pub const MESSAGES_TEXT_SIZE: f32 = 13.0;
+/// The size of a message's text in ZapFast, every theme alike.
+pub const MESSAGE_TEXT_SIZE: f32 = 14.5;
+/// How much larger than Messages' own a ZapFast balloon is drawn: its
+/// geometry keeps Apple's proportions to the text it holds.
+pub const MESSAGES_SCALE: f32 = MESSAGE_TEXT_SIZE / MESSAGES_TEXT_SIZE;
+
+/// How round a picture without a bubble is in the Messages style: a single
+/// line's corner, [`balloon::PILL_RADIUS`] at [`MESSAGES_SCALE`], rounded.
+pub const MESSAGES_BUBBLE_RADIUS: u8 = 15;
+
+/// Apple's message balloon, as the vector artwork ChatKit masks Messages'
+/// balloons with on the Mac: the `mac-bubble`, `mac-bubble-tailless` and
+/// `mac-bubble-multiline` images of
+/// `/System/iOSSupport/System/Library/PrivateFrameworks/ChatKit.framework/Resources/Assets.car`
+/// (macOS 27, build 26A428), read with `assetutil --info` for their sizes and
+/// stretch insets, their PDF paths copied number for number. Lengths are
+/// Messages' points at its 13 pt text; x runs out of the balloon toward the
+/// tail, y up from the balloon's bottom edge, as in the PDFs.
+///
+/// The images are 43 points wide, a 38 point body and 5 points beside it for
+/// the tail, tailless ones too, so a run's balloons line their bodies up. A
+/// single line is 27 points high with circular 13.5 point corners; the
+/// multi-line image swaps them for Apple's continuous corner, 14 points each
+/// way. Both stretch only between their corners, so the body's straight
+/// edges grow and the corners and tail keep their size.
+pub mod balloon {
+    /// One step of an outline: a straight line or a cubic Bézier curve to a
+    /// point, its control points before it.
+    #[derive(Clone, Copy, Debug)]
+    pub enum Step {
+        Line([f32; 2]),
+        Cubic([f32; 2], [f32; 2], [f32; 2]),
+    }
+
+    /// A single line's corner radius (`mac-bubble.pdf`: `0 13.5 m` to
+    /// `13.5 27`).
+    pub const PILL_RADIUS: f32 = 13.5;
+    /// How far a multi-line balloon's continuous corner reaches along each
+    /// edge (`mac-bubble-multiline.pdf`: `14 0` to `0 14`).
+    pub const CORNER: f32 = 14.0;
+    /// Where a circular corner's control points sit, as a share of its
+    /// radius from the corner: Apple's own `6.044156` of `13.5`.
+    pub const ARC_HANDLE: f32 = 6.044_156 / 13.5;
+    /// A continuous corner from the point [`CORNER`] along one edge to the
+    /// point as far along the other, `[along the first, along the second]`
+    /// from the corner itself. Three cubics, symmetric about the diagonal.
+    pub const CONTINUOUS: [Step; 3] = [
+        Step::Cubic(
+            [11.29805, 0.0],
+            [8.841_847, 0.654_906_2],
+            [6.767_773, 1.828_331],
+        ),
+        Step::Cubic(
+            [4.693_699, 3.001_756],
+            [3.001_756, 4.693_699],
+            [1.828_331, 6.767_773],
+        ),
+        Step::Cubic([0.654_906_2, 8.841_847], [0.0, 11.29805], [0.0, 14.0]),
+    ];
+    /// How high above the bottom edge the side leaves its straight line and
+    /// curls into the tail.
+    pub const TAIL_RISE: f32 = 7.5;
+    /// The tail, from [`TAIL_RISE`] up the side to its tip and back along
+    /// its underside to the bottom edge, 2 points out: identical in the
+    /// single- and multi-line images. The 0.9314 line is Apple's.
+    pub const TAIL: [Step; 5] = [
+        Step::Cubic([0.0, 6.097_317], [0.27846, 4.847_764], [0.79683, 3.789_906]),
+        Step::Line([0.9314, 3.529_458]),
+        Step::Cubic(
+            [1.53598, 2.418_347],
+            [2.41835, 1.535_982],
+            [3.52946, 0.931_395_6],
+        ),
+        Step::Cubic(
+            [3.92285, 0.717_337_5],
+            [4.34493, 0.538_100_6],
+            [TIP[0], TIP[1]],
+        ),
+        Step::Cubic([3.9079, 0.138_131_4], [2.97008, 0.0], [2.0, 0.0]),
+    ];
+    /// The tail's tip: how far past the body's side it reaches, and how
+    /// high above the bottom edge.
+    pub const TIP: [f32; 2] = [4.7935, 0.395_861_1];
+    /// Under a single line's tail, the notch back up into the body and its
+    /// rounded corner down to the bottom edge, [`PILL_RADIUS`] in.
+    pub const PILL_NOTCH: [Step; 2] = [
+        Step::Cubic(
+            [-0.76855, 0.0],
+            [-3.27432, 1.125_069],
+            [-5.08506, 2.942_948],
+        ),
+        Step::Cubic([-7.39191, 1.101_345], [-10.31734, 0.0], [-PILL_RADIUS, 0.0]),
+    ];
+    /// The same notch under several lines, which joins the continuous
+    /// corner's last two curves, [`CORNER`] in.
+    pub const MULTILINE_NOTCH: [Step; 3] = [
+        Step::Cubic(
+            [-0.77363, 0.0],
+            [-3.28353, 1.129_208],
+            [-5.09503, 2.952_977],
+        ),
+        Step::Cubic(
+            [-5.61882, 2.537_802],
+            [-6.17784, 2.162_092],
+            [-6.76777, 1.828_331],
+        ),
+        Step::Cubic([-8.84185, 0.654_906_2], [-11.29805, 0.0], [-CORNER, 0.0]),
+    ];
+    /// The body of the single-line image: 38 by 27 points.
+    pub const PILL_SIZE: [f32; 2] = [38.0, 27.0];
+    /// The tallest balloon still drawn as a single line. Messages picks the
+    /// image by its line count: one line of its 13 pt text is 29.3 points
+    /// high with the 7 point insets above and below it
+    /// (`CKUIBehaviorMac.textBalloonPillContentInsets`), two are 44.6; ZapFast
+    /// splits the difference.
+    pub const SINGLE_LINE_MAX: f32 = 37.0;
+}
+
+/// The outline of a Messages balloon whose body fills `rect`, clockwise on
+/// screen, flattened to points: Apple's corners, and with `tail` its curl out
+/// of the bottom corner on that side, reaching [`balloon::TIP`] past it. All
+/// lengths are Apple's times `scale`, shrunk together for a balloon too small
+/// for them, so the outline never crosses itself.
+pub fn messages_balloon(rect: Rect, tail: Option<Side>, scale: f32) -> Vec<egui::Pos2> {
+    use balloon::Step;
+    let multiline = rect.height() > balloon::SINGLE_LINE_MAX * scale;
+    // A single line is at least the image's own height; anything smaller,
+    // or narrower than two corners, takes all of Apple's lengths down
+    // together.
+    let fit = if multiline {
+        2.0 * balloon::CORNER
+    } else {
+        balloon::PILL_SIZE[1]
+    };
+    let scale = scale
+        .min(rect.height() / fit)
+        .min(rect.width() / fit)
+        .max(0.0);
+    let (left, top, right, bottom) = (rect.left(), rect.top(), rect.right(), rect.bottom());
+    let mut points = Vec::new();
+    // A corner from the point `reach` along `first` from `corner` to the
+    // point as far along `second`.
+    let corner = |points: &mut Vec<egui::Pos2>, at: egui::Pos2, first: Vec2, second: Vec2| {
+        let place = |[a, b]: [f32; 2]| at + first * (a * scale) + second * (b * scale);
+        if multiline {
+            let start = place([balloon::CORNER, 0.0]);
+            trace(points, start, &balloon::CONTINUOUS, place);
+        } else {
+            let r = balloon::PILL_RADIUS;
+            let h = r * balloon::ARC_HANDLE;
+            let start = place([r, 0.0]);
+            trace(
+                points,
+                start,
+                &[Step::Cubic([h, 0.0], [0.0, h], [0.0, r])],
+                place,
+            );
+        }
+    };
+    // Drawn with the tail on the right, then mirrored for the left.
+    let side = tail.unwrap_or(Side::Right);
+    // Top left, from the left side to the top edge, then top right.
+    corner(&mut points, pos2(left, top), vec2(0.0, 1.0), vec2(1.0, 0.0));
+    corner(
+        &mut points,
+        pos2(right, top),
+        vec2(-1.0, 0.0),
+        vec2(0.0, 1.0),
+    );
+    if tail.is_some() {
+        // Down the side into the tail, and under it back to the bottom
+        // edge. Apple's y runs up from the bottom edge.
+        let place = |[x, y]: [f32; 2]| pos2(right + x * scale, bottom - y * scale);
+        let start = place([0.0, balloon::TAIL_RISE]);
+        points.push(start);
+        trace(&mut points, start, &balloon::TAIL, place);
+        let notch: &[Step] = if multiline {
+            &balloon::MULTILINE_NOTCH
+        } else {
+            &balloon::PILL_NOTCH
+        };
+        trace(&mut points, place([2.0, 0.0]), notch, place);
+    } else {
+        corner(
+            &mut points,
+            pos2(right, bottom),
+            vec2(0.0, -1.0),
+            vec2(-1.0, 0.0),
+        );
+    }
+    corner(
+        &mut points,
+        pos2(left, bottom),
+        vec2(1.0, 0.0),
+        vec2(0.0, -1.0),
+    );
+    // Straight edges join the corners; drop the points that repeat where
+    // one curve ends and the next begins, the last one included.
+    points.dedup_by(|b, a| a.distance(*b) < 1e-4);
+    if points
+        .last()
+        .is_some_and(|last| last.distance(points[0]) < 1e-4)
+    {
+        points.pop();
+    }
+    if side == Side::Left {
+        for point in &mut points {
+            point.x = left + right - point.x;
+        }
+        // Clockwise either way.
+        points.reverse();
+    }
+    points
+}
+
+/// Appends `steps` from `start`, placed by `place`, as points: each curve
+/// cut into chords about two points long.
+fn trace(
+    points: &mut Vec<egui::Pos2>,
+    start: egui::Pos2,
+    steps: &[balloon::Step],
+    place: impl Fn([f32; 2]) -> egui::Pos2,
+) {
+    let mut from = start;
+    if points.last().is_none_or(|last| last.distance(start) > 1e-4) {
+        points.push(start);
+    }
+    for step in steps {
+        match *step {
+            balloon::Step::Line(to) => {
+                from = place(to);
+                points.push(from);
+            }
+            balloon::Step::Cubic(b, c, d) => {
+                let (b, c, d) = (place(b), place(c), place(d));
+                let length = from.distance(b) + b.distance(c) + c.distance(d);
+                let count = ((length / 2.0).ceil() as usize).clamp(1, 16);
+                points.extend((1..=count).map(|i| {
+                    let t = i as f32 / count as f32;
+                    let u = 1.0 - t;
+                    (from.to_vec2() * (u * u * u)
+                        + b.to_vec2() * (3.0 * u * u * t)
+                        + c.to_vec2() * (3.0 * u * t * t)
+                        + d.to_vec2() * (t * t * t))
+                        .to_pos2()
+                }));
+                from = d;
+            }
+        }
+    }
+}
+
+/// Fills a simple polygon, convex or not, in the colour `color` gives each
+/// point: triangulated by ear clipping, with a strip `feather` points wide
+/// around it that fades to clear, as egui anti-aliases its own shapes. The
+/// fill and its edge are one mesh, so no seam can open between them at any
+/// scale. A colour that changes linearly over the polygon, such as a
+/// vertical gradient, comes out exact, whatever the triangles.
+fn fill_outline(
+    points: &[egui::Pos2],
+    color: impl Fn(egui::Pos2) -> Color32,
+    feather: f32,
+) -> egui::Mesh {
+    let count = points.len();
+    let mut mesh = egui::Mesh::default();
+    if count < 3 {
+        return mesh;
+    }
+    let area: f32 = (0..count)
+        .map(|i| {
+            let (a, b) = (points[i], points[(i + 1) % count]);
+            a.x * b.y - b.x * a.y
+        })
+        .sum();
+    // Positive on screen, where y grows down, for a clockwise outline.
+    let winding = area.signum();
+    for i in 0..count {
+        let (previous, point, next) = (
+            points[(i + count - 1) % count],
+            points[i],
+            points[(i + 1) % count],
+        );
+        let outward = |from: egui::Pos2, to: egui::Pos2| {
+            let along = (to - from).normalized();
+            vec2(along.y, -along.x) * winding
+        };
+        let (before, after) = (outward(previous, point), outward(point, next));
+        let normal = (before + after).normalized();
+        // Keep the strip's width along both edges at a corner.
+        let scale = 1.0 / normal.dot(before).max(0.5);
+        let offset = normal * (feather / 2.0) * scale;
+        mesh.colored_vertex(point - offset, color(point));
+        mesh.colored_vertex(point + offset, Color32::TRANSPARENT);
+    }
+    // The edge strip: inner vertices are even, their faded partners odd.
+    for i in 0..count as u32 {
+        let next = (i + 1) % count as u32;
+        mesh.add_triangle(2 * i, 2 * next, 2 * next + 1);
+        mesh.add_triangle(2 * i, 2 * next + 1, 2 * i + 1);
+    }
+    for [a, b, c] in ear_clip(points, winding) {
+        mesh.add_triangle(2 * a, 2 * b, 2 * c);
+    }
+    mesh
+}
+
+/// Triangles covering a simple polygon whose vertices wind as `winding`
+/// says, by clipping its ears one at a time.
+fn ear_clip(points: &[egui::Pos2], winding: f32) -> Vec<[u32; 3]> {
+    let cross =
+        |a: egui::Pos2, b: egui::Pos2, c: egui::Pos2| (b - a).x * (c - b).y - (b - a).y * (c - b).x;
+    let inside = |p: egui::Pos2, a: egui::Pos2, b: egui::Pos2, c: egui::Pos2| {
+        let (d1, d2, d3) = (cross(a, b, p), cross(b, c, p), cross(c, a, p));
+        d1 * winding > 0.0 && d2 * winding > 0.0 && d3 * winding > 0.0
+    };
+    let mut left: Vec<usize> = (0..points.len()).collect();
+    let mut triangles = Vec::with_capacity(points.len().saturating_sub(2));
+    while left.len() > 3 {
+        let n = left.len();
+        let ear = (0..n).find(|&i| {
+            let (a, b, c) = (left[(i + n - 1) % n], left[i], left[(i + 1) % n]);
+            cross(points[a], points[b], points[c]) * winding >= 0.0
+                && !left
+                    .iter()
+                    .filter(|&&j| j != a && j != b && j != c)
+                    .any(|&j| inside(points[j], points[a], points[b], points[c]))
+        });
+        // A polygon always has an ear; rounding could hide it, and a fan
+        // then covers what is left rather than looping.
+        let Some(i) = ear else {
+            triangles.extend((1..n - 1).map(|k| [left[0], left[k], left[k + 1]].map(|v| v as u32)));
+            return triangles;
+        };
+        let (a, b, c) = (left[(i + n - 1) % n], left[i], left[(i + 1) % n]);
+        triangles.push([a, b, c].map(|v| v as u32));
+        left.remove(i);
+    }
+    triangles.push([left[0], left[1], left[2]].map(|v| v as u32));
+    triangles
+}
+
+/// A triangle in `color` that fades out over `blur` points around its
+/// edges, like the blurred shadow of the bubble it belongs to: a sharp one
+/// showed as a grey wedge beneath the tail's tip. Six vertices.
+fn soft_triangle(points: &[egui::Pos2], color: Color32, blur: f32) -> egui::Shape {
+    let centre = (points
+        .iter()
+        .fold(Vec2::ZERO, |sum, point| sum + point.to_vec2())
+        / points.len() as f32)
+        .to_pos2();
+    let mut mesh = egui::Mesh::default();
+    for point in points {
+        let out = (*point - centre).normalized();
+        mesh.colored_vertex(*point - out * blur / 4.0, color);
+        mesh.colored_vertex(*point + out * blur / 2.0, Color32::TRANSPARENT);
+    }
+    let count = points.len() as u32;
+    // Inner vertices are even, their faded partners odd.
+    mesh.add_triangle(0, 2, 4);
+    for index in 0..count {
+        let next = (index + 1) % count;
+        mesh.add_triangle(2 * index, 2 * index + 1, 2 * next + 1);
+        mesh.add_triangle(2 * index, 2 * next + 1, 2 * next);
+    }
+    egui::Shape::mesh(mesh)
+}
+
+/// Small pill label used for date separators and pinned markers.
+pub fn chip(ui: &mut Ui, palette: &Palette, label: &str) -> egui::Response {
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), theme::medium(12.0), palette.secondary);
+    let size = galley.size() + vec2(20.0, 10.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let radius = CornerRadius::from(rect.height() / 2.0);
+        if palette.vibrant() {
+            // Glass over a vibrant conversation, as the header's.
+            ui.painter().rect_filled(rect, radius, palette.glass());
+            ui.painter()
+                .rect_stroke(rect, radius, palette.glass_edge(), egui::StrokeKind::Inside);
+            ui.painter().galley(
+                rect.center() - galley.size() / 2.0,
+                galley,
+                palette.secondary,
+            );
+            return response;
+        }
+        // A dark panel all but vanished on a dark chat; halfway to the
+        // incoming bubble's colour it reads as a chip without shouting.
+        let fill = if palette.dark {
+            palette.panel.lerp_to_gamma(palette.bubble_in, 0.5)
+        } else {
+            palette.panel
+        };
+        ui.painter()
+            .add(palette.bubble_shadow().as_shape(rect, radius));
+        ui.painter().rect_filled(
+            rect.translate(vec2(0.0, -theme::RAISED_EDGE)),
+            radius,
+            palette.raised_edge(fill),
+        );
+        ui.painter().rect_filled(rect, radius, fill);
+        ui.painter().galley(
+            rect.center() - galley.size() / 2.0,
+            galley,
+            palette.secondary,
+        );
+    }
+    response
+}
+
+/// Selectable pill with an optional count, used for the chat-list filters.
+pub fn filter_chip(
+    ui: &mut Ui,
+    palette: &Palette,
+    label: &str,
+    count: usize,
+    selected: bool,
+) -> egui::Response {
+    dotted_chip(ui, palette, None, label, count, selected)
+}
+
+/// A filter chip led by a coloured dot, for filters the user named and
+/// coloured, such as labels.
+pub fn dotted_chip(
+    ui: &mut Ui,
+    palette: &Palette,
+    dot: Option<Color32>,
+    label: &str,
+    count: usize,
+    selected: bool,
+) -> egui::Response {
+    let color = if selected {
+        palette.accent
+    } else {
+        palette.secondary
+    };
+    let painter = ui.painter();
+    let text = painter.layout_no_wrap(label.to_owned(), theme::medium(12.5), color);
+    let number =
+        (count > 0).then(|| painter.layout_no_wrap(count.to_string(), theme::regular(11.5), color));
+    let gap = 5.0;
+    let dot_width = if dot.is_some() { 8.0 + gap } else { 0.0 };
+    let width =
+        dot_width + text.size().x + number.as_ref().map_or(0.0, |number| gap + number.size().x);
+    let (rect, response) = ui.allocate_exact_size(vec2(width + 18.0, 28.0), Sense::click());
+    theme::reveal_focus(&response);
+    theme::focus_outline(ui, response.id, rect, rect.height() / 2.0);
+    if ui.is_rect_visible(rect) {
+        let radius = rect.height() / 2.0;
+        if selected {
+            ui.painter()
+                .rect_filled(rect, radius, palette.accent.gamma_multiply(0.18));
+        } else {
+            let (hover, edge) = if palette.vibrant() {
+                (
+                    palette.tint(theme::TINT_HOVER),
+                    palette.tint(theme::TINT_SELECTED + theme::TINT_HOVER),
+                )
+            } else {
+                (palette.surface, palette.surface_active)
+            };
+            if response.hovered() {
+                ui.painter().rect_filled(rect, radius, hover);
+            }
+            ui.painter().rect_stroke(
+                rect,
+                radius,
+                Stroke::new(1.0, edge),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if let Some(dot) = dot {
+            ui.painter()
+                .circle_filled(pos2(rect.left() + 13.0, rect.center().y), 4.0, dot);
+        }
+        let mut pos = pos2(
+            rect.left() + 9.0 + dot_width,
+            rect.center().y - text.size().y / 2.0,
+        );
+        let advance = text.size().x + gap;
+        ui.painter().galley(pos, text, color);
+        if let Some(number) = number {
+            pos.x += advance;
+            pos.y = rect.center().y - number.size().y / 2.0;
+            ui.painter().galley(pos, number, color);
+        }
+    }
+    response.widget_info(|| {
+        let label = if count > 0 {
+            format!("{label}, {count} unread")
+        } else {
+            label.to_owned()
+        };
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            label,
+        )
+    });
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A menu open over a button, with a row for each of `labels` (one
+    /// starting with `~` disabled), its first row focused, and the frames
+    /// that letter navigation runs in.
+    struct LetterMenu {
+        ctx: egui::Context,
+        labels: Vec<&'static str>,
+        rows: Vec<egui::Id>,
+        clicked: Vec<usize>,
+        /// The events no one took in the last frame.
+        left: Vec<egui::Event>,
+    }
+
+    impl LetterMenu {
+        fn new(labels: &[&'static str]) -> Self {
+            let mut menu = Self {
+                ctx: egui::Context::default(),
+                labels: labels.to_vec(),
+                rows: Vec::new(),
+                clicked: Vec::new(),
+                left: Vec::new(),
+            };
+            // The popup's first pass only measures it.
+            menu.frame(Vec::new());
+            menu.frame(Vec::new());
+            let first = menu.rows[0];
+            menu.ctx.memory_mut(|memory| memory.request_focus(first));
+            menu.frame(Vec::new());
+            assert_eq!(menu.focused(), Some(0));
+            menu
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            let palette = Palette::dark();
+            let labels = self.labels.clone();
+            let mut rows = Vec::new();
+            let mut clicked = Vec::new();
+            let mut left = Vec::new();
+            let mut output = self.ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    menu_letters(ui.ctx());
+                    let button = ui.button("Menu");
+                    egui::Popup::menu(&button)
+                        .open_memory(Some(egui::SetOpenCommand::Bool(true)))
+                        .show(|ui| {
+                            for (index, label) in labels.iter().enumerate() {
+                                let (label, enabled) = match label.strip_prefix('~') {
+                                    Some(label) => (label, false),
+                                    None => (*label, true),
+                                };
+                                let response =
+                                    menu_item_response(ui, &palette, None, label, enabled);
+                                rows.push(response.id);
+                                if enabled && response.clicked() {
+                                    clicked.push(index);
+                                }
+                            }
+                        });
+                    left = ui.input(|input| input.events.clone());
+                },
+            );
+            output.textures_delta.clear();
+            if !rows.is_empty() {
+                self.rows = rows;
+            }
+            self.clicked.extend(clicked);
+            self.left = left;
+        }
+
+        /// Types `text` as a keyboard does: the key's press, then the text.
+        fn type_text(&mut self, key: egui::Key, text: &str) -> Option<usize> {
+            self.frame(vec![
+                egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Text(text.to_owned()),
+            ]);
+            self.frame(Vec::new());
+            self.focused()
+        }
+
+        fn focused(&self) -> Option<usize> {
+            let focused = self.ctx.memory(|memory| memory.focused())?;
+            self.rows.iter().position(|row| *row == focused)
+        }
+    }
+
+    /// A letter moves to the next row whose label starts with it, in either
+    /// case; the same letter again goes on to the next such row and wraps
+    /// at the end; a letter no row starts with leaves focus where it is.
+    #[test]
+    fn a_letter_moves_to_the_next_row_that_starts_with_it_and_wraps() {
+        let mut menu = LetterMenu::new(&[
+            "Reply",
+            "React",
+            "Copy text",
+            "Forward",
+            "Delete for me",
+            "Delete for everyone",
+        ]);
+        assert_eq!(menu.type_text(egui::Key::C, "c"), Some(2));
+        assert_eq!(menu.type_text(egui::Key::D, "D"), Some(4), "either case");
+        assert_eq!(menu.type_text(egui::Key::D, "d"), Some(5), "the next one");
+        assert_eq!(menu.type_text(egui::Key::D, "d"), Some(4), "wraps");
+        assert_eq!(menu.type_text(egui::Key::R, "r"), Some(0), "past the end");
+        assert_eq!(menu.type_text(egui::Key::R, "r"), Some(1));
+        assert_eq!(menu.type_text(egui::Key::R, "r"), Some(0));
+        assert_eq!(menu.type_text(egui::Key::Z, "z"), Some(0), "no Z row");
+        assert_eq!(menu.type_text(egui::Key::F, "f"), Some(3));
+        assert_eq!(menu.type_text(egui::Key::F, "f"), Some(3), "the only F row");
+    }
+
+    /// A row Tab and the arrows skip, a disabled one, letters skip too.
+    #[test]
+    fn letters_skip_the_rows_the_arrows_skip() {
+        let mut menu = LetterMenu::new(&["Reply", "~Retry", "React"]);
+        assert_eq!(menu.type_text(egui::Key::R, "r"), Some(2));
+        assert_eq!(menu.type_text(egui::Key::R, "r"), Some(0));
+    }
+
+    /// Letters follow what was typed, not the key: an Arabic layout's letters
+    /// find Arabic rows, and an alef with a hamza is found by the plain alef.
+    #[test]
+    fn arabic_letters_find_arabic_rows() {
+        // Reply, Forward (starting with an alef with a hamza below), Delete
+        // (starting with a plain alef), Copy.
+        let mut menu = LetterMenu::new(&[
+            "\u{631}\u{62f}",
+            "\u{625}\u{639}\u{627}\u{62f}\u{629} \u{62a}\u{648}\u{62c}\u{64a}\u{647}",
+            "\u{627}\u{62d}\u{630}\u{641}",
+            "\u{646}\u{633}\u{62e}",
+        ]);
+        // The keys an Arabic layout types these letters with.
+        assert_eq!(menu.type_text(egui::Key::K, "\u{646}"), Some(3));
+        assert_eq!(menu.type_text(egui::Key::H, "\u{627}"), Some(1), "hamza");
+        assert_eq!(menu.type_text(egui::Key::H, "\u{627}"), Some(2));
+        assert_eq!(menu.type_text(egui::Key::V, "\u{631}"), Some(0));
+    }
+
+    /// A letter only moves focus: no row is chosen, the menu stays open, and
+    /// neither the text nor the key that typed it is left for anyone else.
+    /// Space, which presses the focused row, and Ctrl with a letter are left.
+    #[test]
+    fn a_letter_chooses_nothing_and_goes_to_no_one_else() {
+        let mut menu = LetterMenu::new(&["Reply", "Copy text"]);
+        menu.frame(vec![
+            egui::Event::Key {
+                key: egui::Key::C,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::Text("c".into()),
+            egui::Event::Key {
+                key: egui::Key::C,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            },
+        ]);
+        assert_eq!(menu.focused(), Some(1));
+        assert!(menu.clicked.is_empty(), "{:?}", menu.clicked);
+        assert!(egui::Popup::is_any_open(&menu.ctx));
+        assert!(
+            matches!(
+                menu.left.as_slice(),
+                [egui::Event::Key { key: egui::Key::C, modifiers, .. }] if modifiers.command
+            ),
+            "{:?}",
+            menu.left
+        );
+        menu.frame(vec![egui::Event::Text(" ".into())]);
+        assert!(
+            matches!(menu.left.as_slice(), [egui::Event::Text(text)] if text == " "),
+            "{:?}",
+            menu.left
+        );
+        assert_eq!(menu.focused(), Some(1));
+    }
+
+    /// With focus outside the menu, what is typed is left for that control.
+    #[test]
+    fn letters_are_left_alone_without_a_focused_menu_row() {
+        let mut menu = LetterMenu::new(&["Reply", "Copy text"]);
+        menu.ctx
+            .memory_mut(|memory| memory.surrender_focus(menu.rows[0]));
+        menu.frame(vec![egui::Event::Text("c".into())]);
+        assert!(
+            matches!(menu.left.as_slice(), [egui::Event::Text(text)] if text == "c"),
+            "{:?}",
+            menu.left
+        );
+    }
+
+    /// A name too wide for its room rests three seconds at its start, eases
+    /// to its end at 40 points a second on average, rests there as long, and
+    /// comes back the same way. One that fits never moves or repaints.
+    #[test]
+    fn scrolling_text_steps_its_crossing_while_a_screen_reader_is_attached() {
+        use std::time::Duration;
+        // Wide text in a narrow room, drawn in the middle of its first
+        // crossing (after the 3 s rest), when it asks for every frame.
+        let delay = |reader: bool| {
+            let ctx = crate::motion::tests::reading(reader);
+            let draw = |ctx: &egui::Context, time: f64| {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        time: Some(time),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        ui.set_max_width(60.0);
+                        scrolling_text(
+                            ui,
+                            "A picture with a very long name indeed.jpg",
+                            egui::FontId::proportional(14.0),
+                            Color32::WHITE,
+                            Color32::BLACK,
+                        );
+                    },
+                );
+                output.textures_delta.clear();
+                output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+            };
+            draw(&ctx, 0.0);
+            draw(&ctx, 3.5)
+        };
+        assert_eq!(delay(false), Duration::ZERO);
+        let stepped = delay(true);
+        assert!(
+            stepped > Duration::from_millis(75) && stepped <= crate::motion::STEP,
+            "{stepped:?}"
+        );
+    }
+
+    #[test]
+    fn scrolling_text_rests_at_each_end_and_crosses_in_between() {
+        use std::time::Duration;
+        assert_eq!(scroll_offset(10.0, 0.0), (0.0, None));
+        // 80 points over: two seconds each way, a ten-second round trip.
+        let at = |seconds| scroll_offset(seconds, 80.0);
+        assert_eq!(at(0.0), (0.0, Some(Duration::from_secs(3))));
+        assert_eq!(at(2.0).0, 0.0);
+        assert_eq!(
+            at(4.0),
+            (40.0, Some(Duration::ZERO)),
+            "halfway at the midpoint"
+        );
+        assert!(at(3.2).0 < 80.0 * 0.1 / 2.0, "starts gently");
+        assert_eq!(at(5.0), (80.0, Some(Duration::from_secs(3))));
+        assert_eq!(at(7.5).0, 80.0);
+        assert_eq!(at(9.0).0, 40.0, "halfway back");
+        assert_eq!(at(10.0).0, 0.0, "a new round trip begins at the start");
+        assert_eq!(at(14.0).0, 40.0);
+    }
+
+    /// Opens a submenu of `items` in a window `window` points wide, and
+    /// returns its rows' rect with what `menu_width` asks for them.
+    fn shown_submenu(items: &[&str], window: f32) -> (Rect, f32) {
+        let palette = Palette::dark();
+        let ctx = egui::Context::default();
+        let row = pos2(60.0, 60.0);
+        let frame = |events| {
+            let mut shown = None;
+            let mut expected = 0.0;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(window, 800.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    expected = menu_width(ui, items, true);
+                    let button = ui.button("Menu");
+                    egui::Popup::menu(&button)
+                        .open_memory(Some(egui::SetOpenCommand::Bool(true)))
+                        .at_position(row - vec2(40.0, 20.0))
+                        .width(200.0)
+                        .frame(menu_frame(&palette))
+                        .show(|ui| {
+                            shown = submenu(ui, &palette, Icon::Volume2, "Sound", items, |ui| {
+                                for item in items {
+                                    menu_item(ui, &palette, None, item);
+                                }
+                            })
+                            .map(|inner| inner.response.rect);
+                        });
+                },
+            );
+            output.textures_delta.clear();
+            shown.map(|rect| (rect, expected))
+        };
+        frame(vec![]);
+        let mut shown = None;
+        for _ in 0..4 {
+            shown = frame(vec![egui::Event::PointerMoved(row)]);
+        }
+        shown.expect("the submenu opens on hover")
+    }
+
+    /// A submenu is as wide as its labels, not egui's whole `menu_width`,
+    /// which left a wide blank strip after "Notification sound" and
+    /// "Labels" rows.
+    #[test]
+    fn a_submenu_is_as_wide_as_its_labels() {
+        let items = ["Default", "Choose a file…"];
+        let (rect, expected) = shown_submenu(&items, 1600.0);
+        assert!(
+            (rect.width() - expected).abs() <= 4.0,
+            "a submenu for {items:?} is {} points wide, not about {expected}",
+            rect.width()
+        );
+    }
+
+    /// A label wider than the window, such as a custom sound's long file
+    /// name, leaves the submenu inside the window.
+    #[test]
+    fn a_submenu_never_outgrows_the_window() {
+        let long = "a very long notification sound file name ".repeat(12) + ".ogg";
+        let items = ["Default", long.as_str()];
+        let window = 500.0;
+        let (rect, expected) = shown_submenu(&items, window);
+        assert!(expected > window, "the label is wider than the window");
+        assert!(
+            rect.left() >= 0.0 && rect.right() <= window,
+            "a submenu at {rect:?} runs off a {window}-point window"
+        );
+        assert!(
+            rect.width() + 2.0 * SUBMENU_WINDOW_GAP <= window + 0.5,
+            "a submenu {} points wide leaves no gap in a {window}-point window",
+            rect.width()
+        );
+    }
+
+    /// The header's shadow and the chat list's are one shadow turned a
+    /// quarter: as dark at the edge casting it, clear as far into the content.
+    #[test]
+    fn a_panel_casts_beside_it_the_shadow_a_bar_casts_below() {
+        let palette = Palette::dark();
+        let mesh = |shape: egui::Shape| match shape {
+            egui::Shape::Mesh(mesh) => mesh,
+            other => panic!("not a mesh: {other:?}"),
+        };
+        let below = mesh(shadow_mesh(
+            &palette,
+            Rect::from_min_max(pos2(100.0, 50.0), pos2(400.0, 50.0 + SHADOW_REACH)),
+            [true, true, false, false],
+        ));
+        let beside = mesh(shadow_mesh(
+            &palette,
+            Rect::from_min_max(pos2(100.0, 50.0), pos2(100.0 + SHADOW_REACH, 300.0)),
+            [true, false, false, true],
+        ));
+        let shade = palette.lift_shadow().gamma_multiply(0.64);
+        assert_ne!(shade, Color32::TRANSPARENT);
+        for vertex in &below.vertices {
+            let at_edge = vertex.pos.y == 50.0;
+            assert_eq!(vertex.color == shade, at_edge, "{:?}", vertex.pos);
+            assert!(at_edge || vertex.color == Color32::TRANSPARENT);
+        }
+        for vertex in &beside.vertices {
+            let at_edge = vertex.pos.x == 100.0;
+            assert_eq!(vertex.color == shade, at_edge, "{:?}", vertex.pos);
+            assert!(at_edge || vertex.color == Color32::TRANSPARENT);
+        }
+        // Both reach equally far from their edge.
+        let reach = |mesh: &egui::Mesh, along: fn(&egui::epaint::Vertex) -> f32| {
+            let values: Vec<f32> = mesh.vertices.iter().map(along).collect();
+            values.iter().cloned().fold(f32::MIN, f32::max)
+                - values.iter().cloned().fold(f32::MAX, f32::min)
+        };
+        assert_eq!(reach(&below, |v| v.pos.y), reach(&beside, |v| v.pos.x));
+    }
+
+    /// Sent shows one tick and delivered or read two, drawn from our own
+    /// glyphs, where the second tick reaches as high as the first (#249).
+    #[test]
+    fn delivery_ticks_are_our_own_equal_height_glyphs() {
+        assert_eq!(tick_icon(Delivery::Sent), Some(Icon::DeliveryTick));
+        for status in [Delivery::Delivered, Delivery::Read, Delivery::Played] {
+            assert_eq!(tick_icon(status), Some(Icon::DeliveryTicks));
+        }
+        assert_eq!(tick_icon(Delivery::None), None);
+        let svg = include_str!("../../assets/icons/delivery-ticks.svg");
+        let tops: Vec<(f32, f32)> = svg
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("<path d=\"M"))
+            .map(|path| {
+                let numbers: Vec<f32> = path
+                    .split(['"', ' '])
+                    .take(6)
+                    .map(|number| number.parse().expect("a coordinate"))
+                    .collect();
+                // The long arm ends at the path's last point, its top.
+                (numbers[4], numbers[5])
+            })
+            .collect();
+        assert_eq!(tops.len(), 2, "two ticks");
+        assert_eq!(tops[0].1, tops[1].1, "both ticks are as tall: {tops:?}");
+        assert!(tops[1].0 > tops[0].0, "the second tick sits to the right");
+    }
+
+    /// A raised frame lies on its edge: one point higher, under its fill, in
+    /// the palette's raised-edge colour, with the bubble's lift shadow.
+    /// A line of Arabic cut to its width ends with the ellipsis where the
+    /// text ends (its left, in a right-to-left line), inside the width, with
+    /// whole words before it (#72).
+    #[test]
+    fn a_cut_right_to_left_line_stays_in_its_width_and_ends_in_an_ellipsis() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            for text in [
+                "المنصب بتاعك مش هو اللي بيحدد قيمتك في الحياة يا صاحبي",
+                "39: المنصب بتاعك مش هو اللي بيحدد قيمتك في الحياة",
+            ] {
+                let line = line(
+                    ui,
+                    text,
+                    egui::FontId::proportional(13.0),
+                    Color32::WHITE,
+                    150.0,
+                    1,
+                );
+                let galley = &line.galley;
+                assert_eq!(galley.rows.len(), 1, "{text}");
+                assert!(galley.size().x <= 150.0, "{text}: {}", galley.size().x);
+                let shown = galley.text();
+                assert!(shown.ends_with('…'), "{shown}");
+                let kept = shown.trim_end_matches('…');
+                assert!(text.starts_with(kept), "the start is kept: {shown}");
+                // The ellipsis is drawn leftmost: the text ends on the left.
+                let row = &galley.rows[0];
+                let mark = row.glyphs.iter().find(|glyph| glyph.chr == '…').unwrap();
+                assert!(
+                    row.glyphs
+                        .iter()
+                        .filter(|glyph| bidi::is_strong_rtl(glyph.chr))
+                        .all(|glyph| glyph.pos.x > mark.pos.x),
+                    "{shown}"
+                );
+                assert_eq!(line.accessible_text, text);
+            }
+            // A line that fits is left alone.
+            let short = line(
+                ui,
+                "مرحبا",
+                egui::FontId::proportional(13.0),
+                Color32::WHITE,
+                150.0,
+                1,
+            );
+            assert_eq!(short.galley.text(), "مرحبا");
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn a_raised_frame_draws_its_edge_under_its_fill() {
+        let palette = Palette::dark();
+        let ctx = egui::Context::default();
+        let mut rect = Rect::NOTHING;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            rect = raised(
+                ui,
+                &palette,
+                egui::Frame::new().fill(palette.surface).inner_margin(8),
+                |ui| ui.label("x"),
+            )
+            .response
+            .rect;
+        });
+        output.textures_delta.clear();
+        // In paint order, looking inside grouped shapes (a frame groups its
+        // shadow with its fill).
+        let mut fills: Vec<(Rect, Color32)> = Vec::new();
+        let mut pending: Vec<&egui::Shape> = output
+            .shapes
+            .iter()
+            .rev()
+            .map(|clipped| &clipped.shape)
+            .collect();
+        while let Some(shape) = pending.pop() {
+            match shape {
+                egui::Shape::Vec(shapes) => pending.extend(shapes.iter().rev()),
+                egui::Shape::Rect(shape) => fills.push((shape.rect, shape.fill)),
+                _ => {}
+            }
+        }
+        let edge = fills
+            .iter()
+            .position(|(at, fill)| {
+                *at == rect.translate(vec2(0.0, -theme::RAISED_EDGE))
+                    && *fill == palette.raised_edge(palette.surface)
+            })
+            .expect("the edge is drawn");
+        let body = fills
+            .iter()
+            .position(|(at, fill)| *at == rect && *fill == palette.surface)
+            .expect("the frame is drawn");
+        assert!(edge < body, "the edge lies under the fill");
+    }
+
+    #[test]
+    fn a_tail_squares_its_corner_and_points_toward_the_sender() {
+        assert_eq!(bubble_corners(None), CornerRadius::same(BUBBLE_RADIUS));
+        let left = bubble_corners(Some(Side::Left));
+        assert_eq!((left.nw, left.ne), (0, BUBBLE_RADIUS));
+        let right = bubble_corners(Some(Side::Right));
+        assert_eq!((right.nw, right.ne), (BUBBLE_RADIUS, 0));
+
+        let rect = Rect::from_min_size(pos2(100.0, 50.0), vec2(200.0, 40.0));
+        let palette = Palette::light();
+        for (side, outside) in [(Side::Left, 92.0), (Side::Right, 308.0)] {
+            let egui::Shape::Vec(shapes) =
+                bubble_shape(&palette, rect, palette.bubble_out, Some(side), 2.0, SCREEN)
+            else {
+                panic!("a bubble is a list of shapes");
+            };
+            // The tail's tip reaches out of the bubble at its top edge. The
+            // tail is the last filled triangle, over its shadow and edge.
+            let tip = shapes
+                .iter()
+                .rev()
+                .find_map(|shape| match shape {
+                    egui::Shape::Path(path) if path.fill == palette.bubble_out => Some(path),
+                    _ => None,
+                })
+                .into_iter()
+                .flat_map(|path| path.points.iter())
+                .find(|point| !rect.contains(**point));
+            assert_eq!(tip.copied(), Some(pos2(outside, rect.top())));
+        }
+        // Later messages of a run draw no tail.
+        let egui::Shape::Vec(shapes) =
+            bubble_shape(&palette, rect, palette.bubble_in, None, 2.0, SCREEN)
+        else {
+            panic!("a bubble is a list of shapes");
+        };
+        assert!(
+            !shapes
+                .iter()
+                .any(|shape| matches!(shape, egui::Shape::Path(_)))
+        );
+    }
+
+    /// WhatsApp's bubbles are drawn exactly as before the Messages balloon
+    /// was rebuilt: every shape, point and colour of a tailed and a tailless
+    /// bubble, in both palettes, hashes to the value recorded then.
+    #[test]
+    fn whatsapp_bubbles_are_unchanged() {
+        let rect = Rect::from_min_size(pos2(100.5, 50.25), vec2(213.75, 41.5));
+        // FNV-1a, stable across toolchains, over every shape's debug text.
+        let mut fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
+        for palette in [Palette::dark(), Palette::light()] {
+            for tail in [None, Some(Side::Left), Some(Side::Right)] {
+                for (fill, ppp) in [(palette.bubble_out, 1.0), (palette.bubble_in, 1.5)] {
+                    let shape = bubble_shape(&palette, rect, fill, tail, ppp, SCREEN);
+                    for byte in format!("{shape:?}").bytes() {
+                        fingerprint = (fingerprint ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+                    }
+                }
+            }
+        }
+        println!("whatsapp bubble fingerprint {fingerprint:#x}");
+        assert_eq!(fingerprint, WHATSAPP_BUBBLES);
+    }
+
+    /// The fingerprint [`whatsapp_bubbles_are_unchanged`] recorded.
+    const WHATSAPP_BUBBLES: u64 = 0x179b_3424_7615_2b9a;
+
+    /// Every shape-checking test below draws into this view.
+    const SCREEN: egui::Rangef = egui::Rangef {
+        min: 0.0,
+        max: 800.0,
+    };
+
+    /// Twice the signed area of `outline`: positive when it runs clockwise
+    /// on screen, where y grows down.
+    fn twice_area(outline: &[egui::Pos2]) -> f32 {
+        (0..outline.len())
+            .map(|i| {
+                let (a, b) = (outline[i], outline[(i + 1) % outline.len()]);
+                a.x * b.y - b.x * a.y
+            })
+            .sum()
+    }
+
+    /// The balloon mirrored back from the left, in the same order, so its
+    /// tail is checked as a right one.
+    fn as_right(rect: Rect, side: Side, scale: f32) -> Vec<egui::Pos2> {
+        let mut outline = messages_balloon(rect, Some(side), scale);
+        if side == Side::Left {
+            for point in &mut outline {
+                point.x = rect.left() + rect.right() - point.x;
+            }
+            outline.reverse();
+        }
+        outline
+    }
+
+    /// One line of Messages' text and two, at a scale: 29.3 and 44.6 points
+    /// high at its own size.
+    fn balloons(scale: f32) -> [Rect; 2] {
+        [29.3, 44.6]
+            .map(|height| Rect::from_min_size(pos2(100.0, 100.0), vec2(180.0, height) * scale))
+    }
+
+    /// The tail curls out of the bottom corner exactly as far as Apple's:
+    /// its tip 4.7935 points past the body's side and 0.3959 above its
+    /// bottom, nothing below the bottom edge or past the other side, and
+    /// the side straight down to 7.5 points above the bottom.
+    #[test]
+    fn messages_tail_reaches_as_far_as_apples() {
+        for scale in [1.0, MESSAGES_SCALE, 2.0] {
+            for rect in balloons(scale) {
+                for side in [Side::Right, Side::Left] {
+                    let outline = as_right(rect, side, scale);
+                    let tip = outline
+                        .iter()
+                        .copied()
+                        .max_by(|a, b| a.x.total_cmp(&b.x))
+                        .unwrap();
+                    let expected = pos2(
+                        rect.right() + balloon::TIP[0] * scale,
+                        rect.bottom() - balloon::TIP[1] * scale,
+                    );
+                    assert!(
+                        tip.distance(expected) < 1e-3,
+                        "{side:?} at {scale}: the tip is at {tip:?}, not {expected:?}"
+                    );
+                    assert!(
+                        outline.iter().all(|point| point.y <= rect.bottom() + 1e-3
+                            && point.y >= rect.top() - 1e-3
+                            && point.x >= rect.left() - 1e-3),
+                        "{side:?} at {scale}: the balloon leaves its body's bounds"
+                    );
+                    // The side: points on the body's edge reach down to the
+                    // tail's start and no further.
+                    let lowest_on_side = outline
+                        .iter()
+                        .filter(|point| (point.x - rect.right()).abs() < 1e-3)
+                        .map(|point| point.y)
+                        .fold(f32::MIN, f32::max);
+                    assert!(
+                        (lowest_on_side - (rect.bottom() - balloon::TAIL_RISE * scale)).abs()
+                            < 1e-3,
+                        "{side:?} at {scale}: the side leaves for the tail at {lowest_on_side}"
+                    );
+                }
+                // Without a tail the body is all there is.
+                let tailless = messages_balloon(rect, None, scale);
+                let right = tailless.iter().map(|p| p.x).fold(f32::MIN, f32::max);
+                assert!((right - rect.right()).abs() < 1e-3);
+            }
+        }
+    }
+
+    /// A single line has circular corners of 13.5 points; several lines
+    /// Apple's continuous corner, which meets its edges 14 points from the
+    /// corner and passes through the joins of its three curves.
+    #[test]
+    fn messages_corners_are_apples() {
+        for scale in [1.0, MESSAGES_SCALE, 2.0] {
+            let [single, multiple] = balloons(scale);
+            let radius = balloon::PILL_RADIUS * scale;
+            let centre = single.left_top() + vec2(radius, radius);
+            let corner: Vec<_> = messages_balloon(single, None, scale)
+                .into_iter()
+                .filter(|point| point.x <= centre.x && point.y <= centre.y)
+                .collect();
+            assert!(corner.len() > 4, "the corner is a curve");
+            for point in &corner {
+                // Apple's arc is a cubic, a few thousandths off the circle.
+                assert!(
+                    (point.distance(centre) - radius).abs() < 0.01 * scale,
+                    "{point:?} is off the {radius} point corner"
+                );
+            }
+            let outline = messages_balloon(multiple, None, scale);
+            let reach = balloon::CORNER * scale;
+            for expected in [
+                multiple.left_top() + vec2(0.0, reach),
+                multiple.left_top() + vec2(reach, 0.0),
+                multiple.right_top() + vec2(-6.767_773, 1.828_331) * scale,
+                multiple.right_top() + vec2(-1.828_331, 6.767_773) * scale,
+                multiple.left_bottom() + vec2(6.767_773, -1.828_331) * scale,
+            ] {
+                assert!(
+                    outline.iter().any(|point| point.distance(expected) < 1e-3),
+                    "the continuous corner misses {expected:?} at {scale}"
+                );
+            }
+            // A taller balloon of several lines keeps the same corners.
+            let tall = Rect::from_min_size(multiple.min, vec2(multiple.width(), 300.0));
+            assert!(
+                messages_balloon(tall, Some(Side::Right), scale)
+                    .iter()
+                    .any(|point| point.distance(tall.right_top() + vec2(-reach, 0.0)) < 1e-3)
+            );
+        }
+    }
+
+    /// Every balloon, any size, tail or none, is one closed outline that
+    /// never crosses itself, runs clockwise, and repeats no point.
+    #[test]
+    fn messages_balloons_are_simple_closed_outlines() {
+        let crosses = |a: egui::Pos2, b: egui::Pos2, c: egui::Pos2, d: egui::Pos2| {
+            let turn = |p: egui::Pos2, q: egui::Pos2, r: egui::Pos2| {
+                (q - p).x * (r - p).y - (q - p).y * (r - p).x
+            };
+            let (d1, d2) = (turn(a, b, c), turn(a, b, d));
+            let (d3, d4) = (turn(c, d, a), turn(c, d, b));
+            d1 * d2 < 0.0 && d3 * d4 < 0.0
+        };
+        let sizes = [
+            vec2(10.0, 10.0),
+            vec2(30.0, 20.0),
+            vec2(36.0, 32.7),
+            vec2(400.0, 32.7),
+            vec2(60.0, 49.8),
+            vec2(420.0, 240.0),
+        ];
+        for scale in [1.0, MESSAGES_SCALE, 2.0] {
+            for size in sizes {
+                let rect = Rect::from_min_size(pos2(12.5, 40.25), size);
+                for tail in [None, Some(Side::Left), Some(Side::Right)] {
+                    let outline = messages_balloon(rect, tail, scale);
+                    let n = outline.len();
+                    assert!(n >= 8, "{size:?} {tail:?}: {n} points");
+                    assert!(
+                        twice_area(&outline) > 0.0,
+                        "{size:?} {tail:?}: not clockwise"
+                    );
+                    for i in 0..n {
+                        assert!(
+                            outline[i].distance(outline[(i + 1) % n]) > 1e-5,
+                            "{size:?} {tail:?}: a point repeats at {i}"
+                        );
+                        for j in i + 2..n {
+                            if (j + 1) % n == i {
+                                continue;
+                            }
+                            assert!(
+                                !crosses(
+                                    outline[i],
+                                    outline[(i + 1) % n],
+                                    outline[j],
+                                    outline[(j + 1) % n]
+                                ),
+                                "{size:?} {tail:?} at {scale}: edges {i} and {j} cross"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The balloon grows with the text it holds: at twice the scale, a body
+    /// twice the size has a tail reaching twice as far and four times the
+    /// area. ZapFast's scale is its text size over Messages' 13 points.
+    #[test]
+    fn messages_balloons_scale_with_text_size() {
+        assert_eq!(MESSAGES_SCALE, MESSAGE_TEXT_SIZE / MESSAGES_TEXT_SIZE);
+        assert_eq!(
+            MESSAGES_BUBBLE_RADIUS,
+            (balloon::PILL_RADIUS * MESSAGES_SCALE).round() as u8
+        );
+        for (rect, tail) in balloons(1.0).into_iter().zip([Some(Side::Right), None]) {
+            let small = messages_balloon(rect, tail, 1.0);
+            let big = messages_balloon(Rect::from_min_size(rect.min, rect.size() * 2.0), tail, 2.0);
+            let ratio = twice_area(&big) / twice_area(&small);
+            assert!((ratio - 4.0).abs() < 0.02, "{ratio}");
+            let reach = |outline: &[egui::Pos2]| {
+                outline.iter().map(|p| p.x).fold(f32::MIN, f32::max) - rect.left()
+            };
+            assert!((reach(&big) - 2.0 * reach(&small)).abs() < 1e-3);
+        }
+    }
+
+    /// The outline is filled exactly, concave notch and all: its triangles
+    /// cover its area and no more, every point has a filled vertex and a
+    /// clear one just outside, a feather one pixel wide at every scale, all
+    /// in one mesh so nothing can open between tail and body. Tailless
+    /// balloons are meshes too.
+    #[test]
+    fn messages_balloons_are_filled_as_their_outline() {
+        let palette = Palette::messages();
+        let rect = Rect::from_min_size(pos2(100.0, 100.0), vec2(200.0, 34.0));
+        for tail in [Some(Side::Right), Some(Side::Left), None] {
+            let outline = messages_balloon(rect, tail, MESSAGES_SCALE);
+            let area = |a: egui::Pos2, b: egui::Pos2, c: egui::Pos2| {
+                ((b - a).x * (c - a).y - (b - a).y * (c - a).x).abs() / 2.0
+            };
+            let triangles = ear_clip(&outline, 1.0);
+            assert_eq!(triangles.len(), outline.len() - 2);
+            let covered: f32 = triangles
+                .iter()
+                .map(|t| {
+                    area(
+                        outline[t[0] as usize],
+                        outline[t[1] as usize],
+                        outline[t[2] as usize],
+                    )
+                })
+                .sum();
+            let polygon = twice_area(&outline) / 2.0;
+            assert!(
+                (covered - polygon).abs() < 0.5,
+                "{tail:?}: {covered} for {polygon}"
+            );
+            for ppp in [1.0, 1.25, 1.5, 2.0] {
+                let egui::Shape::Mesh(mesh) =
+                    bubble_shape(&palette, rect, palette.bubble_in, tail, ppp, SCREEN)
+                else {
+                    panic!("a Messages balloon is one mesh");
+                };
+                assert_eq!(mesh.vertices.len(), outline.len() * 2);
+                for (pair, point) in mesh.vertices.chunks(2).zip(&outline) {
+                    assert_eq!(pair[0].color, palette.bubble_in);
+                    assert_eq!(pair[1].color, Color32::TRANSPARENT);
+                    // Half a pixel either side of the outline, wider only
+                    // where a sharp corner keeps the strip's width.
+                    let inner = pair[0].pos.distance(*point) * ppp;
+                    let outer = pair[1].pos.distance(*point) * ppp;
+                    assert!((0.499..=1.001).contains(&inner), "{inner} at {ppp}");
+                    assert!((inner - outer).abs() < 1e-3, "{inner} and {outer}");
+                }
+                // The fill uses only filled vertices, so it meets the
+                // feather along shared edges.
+                let strip = 6 * outline.len();
+                assert!(mesh.indices[strip..].iter().all(|index| index % 2 == 0));
+            }
+        }
+    }
+
+    /// Your own balloons shade from the palette's colour at the top of the
+    /// view to Messages' deeper one at its bottom; others' stay flat, and
+    /// WhatsApp's palettes have no gradient.
+    #[test]
+    fn messages_own_balloons_shade_down_the_view() {
+        for palette in [Palette::messages(), Palette::messages_light()] {
+            let (top, bottom) = palette.bubble_out_gradient().expect("a gradient");
+            assert_eq!(top, palette.bubble_out);
+            let at = |y: f32| Rect::from_min_size(pos2(100.0, y), vec2(200.0, 34.0));
+            let colour = |rect: Rect, fill: Color32| {
+                let egui::Shape::Mesh(mesh) =
+                    bubble_shape(&palette, rect, fill, Some(Side::Right), 2.0, SCREEN)
+                else {
+                    panic!("a Messages balloon is one mesh");
+                };
+                mesh.vertices[0].color
+            };
+            let high = colour(at(0.0), palette.bubble_out);
+            let low = colour(at(SCREEN.max - 34.0), palette.bubble_out);
+            assert_eq!(colour(at(-200.0), palette.bubble_out), top);
+            assert!(high != low && low != top);
+            let lum = |c: Color32| u32::from(c.r()) + u32::from(c.g()) + u32::from(c.b());
+            assert!(lum(low) < lum(high), "deeper toward the bottom");
+            assert_eq!(colour(at(SCREEN.max + 200.0), palette.bubble_out), bottom);
+            assert_eq!(colour(at(400.0), palette.bubble_in), palette.bubble_in);
+        }
+        assert_eq!(Palette::dark().bubble_out_gradient(), None);
+        assert_eq!(Palette::light().bubble_out_gradient(), None);
+    }
+
+    /// The knob radius and the track outline a switch paints in one state.
+    fn switch_shapes(on: bool) -> (f32, f32) {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut value = on;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            switch(ui, &crate::theme::Palette::light(), &mut value);
+        });
+        output.textures_delta.clear();
+        let mut knob = 0.0_f32;
+        let mut outline = 0.0_f32;
+        for clipped in &output.shapes {
+            match &clipped.shape {
+                egui::Shape::Circle(circle) => knob = knob.max(circle.radius),
+                egui::Shape::Rect(rect) => outline = outline.max(rect.stroke.width),
+                _ => {}
+            }
+        }
+        (knob, outline)
+    }
+
+    /// On and off differ in shape, not only in colour (WCAG 1.4.1).
+    #[test]
+    fn a_switch_shows_its_state_without_colour() {
+        let (off_knob, off_outline) = switch_shapes(false);
+        let (on_knob, on_outline) = switch_shapes(true);
+        assert!(off_outline > 0.0, "the off track is outlined");
+        assert_eq!(on_outline, 0.0, "the on track is filled, not outlined");
+        assert!(on_knob > off_knob, "the knob grows when on");
+    }
+}

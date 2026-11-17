@@ -2,15 +2,15 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "module description"
+      "value": "WhatIsIt WhatsApp client"
     },
     {
       "name": "EntryAbility_desc",
-      "value": "description"
+      "value": "WhatIsIt WhatsApp client"
     },
     {
       "name": "EntryAbility_label",
-      "value": "Messages"
+      "value": "WhatIsIt"
     },
     {
       "name": "location_permission_reason",

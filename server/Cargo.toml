@@ -3,6 +3,14 @@ name = "whatisit-server"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "whatisit_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "whatisit-server"
+path = "src/main.rs"
+
 [dependencies]
 # WhatsApp protocol client (QR pairing, messages, media, history sync).
 # default-features = false avoids the nightly-only `simd` in wacore-binary;

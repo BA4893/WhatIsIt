@@ -1,211 +1,232 @@
-# WhatIsIt — WhatsApp on HarmonyOS (native protocol client)
+# WhatIsIt
 
-A native HarmonyOS WhatsApp client whose session runs on a **whatisit-server**
-(always-on VPS). The user links once by scanning an in-app QR code — or typing
-an 8-char phone-number code — with the WhatsApp Android/iPhone app; after that
-the server keeps the session alive — no PC, no Chrome, no container needed.
+<p align="center">
+  <b>A native, design-led WhatsApp client for HarmonyOS.</b><br>
+  ArkTS · Stage model · API 26 · phone, tablet and 2-in-1
+</p>
 
+WhatIsIt is a reimagined third-party WhatsApp client. It takes the social-shell
+structure and native HarmonyOS design language of the
+[Harmony X](https://github.com/haohaoai0/HarmonyX) reference and applies it to
+WhatsApp: **Chats** as the default root, **Updates**, **Calls**, **Communities**
+and **Settings**, with a floating compose action and a warm, light/dark visual
+system built from HarmonyOS resources and `SymbolGlyph` icons.
+
+Sample conversations, statuses, calls and communities are available before
+anything is configured, so the app is usable as a design-complete shell from
+first launch. WhatsApp API access and device linking are opt-in.
+
+---
+
+## Highlights
+
+| | |
+|:--|:--|
+| **Complete social shell** | Chats (default root), Updates, Calls, Communities, Settings, chat threads, a floating compose menu and full-screen status viewing. |
+| **Native HarmonyOS design** | ArkUI, system symbols, light/dark resource palettes, adaptive phone / tablet / 2-in-1 layouts. |
+| **WhatsApp API when configured** | Save a Client ID in Settings, then authorize with **OAuth 2.0 PKCE** in the system browser. No client secret is stored on-device. |
+| **Actual device linking** | The Link a device sheet supports the native QR code and phone-number pairing when a WhatsApp engine is reachable, and the real WhatsApp Web QR/phone flow when it is not. |
+| **Honest states** | “Preview” and “Live” badges, sample content before linking, and clear feedback when a call, status or message needs a linked device. |
+
+## Screens
+
+- **Chats** — search, All / Unread / Groups filters, unread badges, pinned rows,
+  group markers, and a floating compose action.
+- **Updates** — My status, recent status circles, followed channels and a
+  discover entry point.
+- **Calls** — recent voice/video history with missed-call treatment, a new-call
+  picker, and the native call surface for linked devices.
+- **Communities** — a hero card, community cards, join/open actions and a
+  discover entry point.
+- **Settings** — profile card, WhatsApp API (Client ID + OAuth PKCE), linked
+  device, WhatsApp Web fallback, appearance (System / Light / Dark),
+  notifications, read receipts and about.
+- **Thread** — WhatsApp-style incoming/outgoing bubbles, date chip, delivery
+  ticks, attachment/camera/mic entry points, voice/video call buttons and a
+  composer.
+
+## Design notes
+
+- **Warm WhatsApp palette** in `resources/base` and `resources/dark`:
+  `#25D366` brand, `#F0F2F5` page, `#FFFFFF` surface, `#111B21` ink in light;
+  `#0B141A` page, `#111B21` surface, `#E9EDEF` ink in dark.
+- **System-first** — HarmonyOS Sans, `SymbolGlyph` icons, resource colors only
+  in pages, 4pt spacing rhythm and 16–24px card radii.
+- **Adaptive shell** — a bottom tab bar on phones, a compact navigation rail on
+  tablets and 2-in-1 windows; the content column widens while keeping readable
+  line lengths.
+- **No hidden server form** — device linking is a first-class sheet, not a
+  developer-only IP field.
+
+## Project configuration
+
+| Setting | Value |
+|:--|:--|
+| Bundle | `com.example.whatisit` · version `2.0.0` (`versionCode` 2000000) |
+| Module | `entry` · Stage model |
+| SDK | target / compatible `26.0.0` |
+| Devices | `default`, `tablet`, `2in1` |
+| Window modes | fullscreen, split, floating |
+| Permissions | Internet, camera, microphone, location, contacts, background running |
+| Deep link | `whatisit://callback` (OAuth redirect) |
+| Root page | `pages/Index` |
+| OAuth callback page | `pages/OAuthCallback` |
+
+## Build
+
+With DevEco Studio: open the project and **Build → Build Hap(s)**.
+
+With the command-line tools:
+
+```bash
+hvigorw --mode module -p product=default -p buildMode=debug assembleHap
 ```
-HarmonyOS device (WhatIsIt)
-   native ArkUI: QR pairing screen → chat list → thread (native bubbles, media,
-   reactions, delivery ticks, WhatsApp-native calls)
-        │  HTTP: /status /pair /pair-code /passkey/* /chats /messages /send
-        │        /send-media /read /react /logout /call/* /media/{id}/{kind}
-        │  WS:   /ws push {qr, linked, message, receipt, chats, logged_out,
-        │        incoming_call, passkey_request, passkey_confirmation} + binary
-        │        media frames (audio PCM + H.264 video)
-        ▼
-whatisit-server (Go, whatsmeow + meowcaller) — WhatsApp Multi-Device protocol,
-Signal E2EE, SQLite session store, keepalive + auto-reconnect, media cache,
-1:1 voice/video calls, SHORTCAKE passkey linking
+
+Output:
+
+```text
+entry/build/default/outputs/default/entry-default-unsigned.hap
 ```
 
-> **Backend**: `server-go/` is the current backend — a wire-compatible port of
-> the original Rust `server/` (whatsapp-rust). It has been **live-validated
-> end-to-end** (QR link, full-history sync, live messaging, persistence across
-> restarts). The Rust `server/` is kept as the historical reference.
+> The CLI build is unsigned when the DevEco signing material is not readable by
+> the command-line user. Sign in DevEco Studio before installing.
 
-## How it works
+## Configure WhatsApp sign-in
 
-1. The user opens the app — it shows a **QR code** (native ArkUI `QRCode`), or
-   taps **Link with phone number instead** to get an 8-char code typed into
-   WhatsApp.
-2. WhatsApp → Linked Devices → Link a Device → scan (or enter the code).
-3. If the account is in WhatsApp's **passkey cohort**, the server pushes a
-   `passkey_request` event; the app completes the WebAuthn assertion (see
-   "Passkey linking" below) and shows any verification code.
-4. The app auto-routes to the chat list. Chats/messages come from the server
-   over HTTP + WebSocket push (no browser, no DOM scraping).
-5. The server keeps the socket alive (own keepalive + auto-reconnect), so the
-   session survives indefinitely while the VPS is up — the app needs no
-   keep-alive ping (battery win).
+1. Create an app on the WhatsApp/Meta developer platform.
+2. Enable OAuth 2.0 and set the redirect URI to `whatisit://callback`.
+3. Open **Settings → WhatsApp API** in WhatIsIt, paste the **Client ID**, tap
+   **Save**, then **Connect WhatsApp**.
+4. The system browser opens the provider's authorization page. The app uses
+   PKCE (S256) and never stores a client secret.
+5. After the browser redirects to `whatisit://callback`, the app exchanges the
+   code and shows **API connected** in Settings.
 
-## Passkey linking (SHORTCAKE)
+The default provider endpoints are Meta's public OAuth endpoints in
+`services/WhatsAppOAuth.ets`; a compatible provider can be substituted there.
+Some WhatsApp APIs require business verification or paid access; the UI reports
+the provider error instead of pretending the connection succeeded.
 
-Meta's 2026 passkey device-link gate requires a WebAuthn assertion from a
-passkey already registered to the account. `whatsmeow` implements the
-handshake; the server bridges the app into it:
+## Link a device
 
-- WS `passkey_request {options}` — the `PublicKeyCredentialRequestOptions` JSON;
-  the app runs a WebAuthn `get` and POSTs the assertion to `/passkey/assertion`.
-- WS `passkey_confirmation {code}` — a verification code to show on the phone
-  (fresh links).
-- HTTP `/passkey/request`, `/passkey/assertion`, `/passkey/confirm`,
-  `/passkey/cancel` — the app ↔ server seam.
+**Settings → Link a device** opens the linking sheet:
 
-> This SDK version has no Credential Manager / WebAuthn API, so the app's
-> passkey card accepts a pasted assertion JSON as a developer fallback. Swap in
-> a native `navigator.credentials.get` call in `PasskeyService.obtainAssertion`
-> the moment `@kit` ships WebAuthn.
+- **QR code** — scan with WhatsApp on another phone.
+- **Phone number** — enter the country code and national number, then type the
+  8-character code in WhatsApp's *Link with phone number instead* flow and
+  approve the notification on the phone.
+- **Use WhatsApp Web instead** — opens the real `web.whatsapp.com` in ArkWeb
+  for the official QR/phone-number flow. This needs no backend and keeps its
+  session in the app's WebView storage.
 
-## Files
+The native QR/phone path needs the existing WhatsApp engine/backend
+(`server-go/` or an embedded engine). Without it, the shell stays in **Preview**
+mode and the Link sheet offers the WhatsApp Web fallback.
 
-| File | Purpose |
+### Passkey-protected accounts
+
+WhatsApp has a passkey/“SHORTCAKE” gate for many accounts. ArkWeb can show the
+passkey prompt but cannot complete the assertion on this device. The WebView
+injects a small `navigator.credentials.get` shim that asks a **PC bridge** for
+the assertion; the passkey stays in Chrome. This needs no server.
+
+1. On the PC with Chrome and the passkey:
+
+   ```bash
+   node bridge/agent.js --token <long-random-token>
+   ```
+
+2. In the app: **Settings → Passkey bridge**, enter the PC LAN address, port
+   (default `18771`) and token. Tap **Test bridge**.
+3. Open **Settings → WhatsApp Web**, link with phone number, enter the code on
+   the phone, then complete the passkey prompt in Chrome on the PC.
+
+The WebView must stay alive during the link; on one phone use split-screen or a
+second device. See [bridge/README.md](bridge/README.md) for the full setup,
+security notes and limitations.
+
+## Architecture
+
+| Path | Purpose |
 |---|---|
-| `server-go/` | Go backend (current): `config.go`, `auth.go`, `state.go`, `events.go`, `store.go`, `client.go` (whatsmeow wrapper), `media.go`, `extract.go`, `calls.go` (meowcaller relay), `web.go` (HTTP + WS + passkey + call endpoints), `ws.go` (WS + media relay), `parity_test.go` (wire-compat suite), `Dockerfile`, `deploy/`. |
-| `server/` | Rust backend (reference, pre-migration): `main.rs`, `events.rs`, `state.rs`, `history.rs`, `store.rs`, `media.rs`, `web.rs`, `calls.rs`, `DEPLOY.md`. |
-| `entry/src/main/ets/services/CdpBridge.ets` | The app's backend client (HTTP + WS + passkey + calls); keeps the page-facing API. |
-| `entry/src/main/ets/services/PasskeyService.ets` | SHORTCAKE passkey ceremony orchestration (assertion submit/confirm/cancel). |
-| `entry/src/main/ets/services/ServerConfig.ets` | Hidden backend host/port/token constants (no UI plumbing). |
-| `entry/src/main/ets/pages/MainPage.ets` | QR pairing screen (QR + phone-code + passkey card) → chats → thread. |
-| `entry/src/main/ets/pages/ChatListView.ets` / `ChatThreadView.ets` | Native chat list + thread (media, reactions, ticks, WhatsApp-native calls). |
-| `entry/src/main/ets/pages/CallSurfaceView.ets` / `services/CallService.ets` / `CallAudio.ets` | WhatsApp-native call UI (XComponent surfaces, PiP) + media relay. |
-| `entry/src/main/cpp/` | Native `call_media` module: OH_VideoEncoder/Decoder (H.264), NAPI bridge. |
-| `entry/src/main/ets/services/MediaDownloader.ets` | Downloads `/media/{id}` into the private sandbox for native rendering. |
+| `pages/Index.ets` | The adaptive shell, five tabs, header, floating compose, thread routing and sheet state. |
+| `pages/OAuthCallback.ets` | PKCE code exchange and session persistence. |
+| `pages/WebLoginView.ets` | In-app WhatsApp Web login fallback. |
+| `components/ChatsPane.ets` / `ChatRow.ets` | Default Chats root. |
+| `components/UpdatesPane.ets` | Status + channels. |
+| `components/CallsPane.ets` | Call history; wire-up to `CallService`. |
+| `components/CommunitiesPane.ets` | Community cards and join state. |
+| `components/SettingsPane.ets` | Profile, Client ID, OAuth, link, appearance, preferences. |
+| `components/ConversationView.ets` | Thread bubbles, ticks, composer, call buttons. |
+| `components/ComposeSheet.ets` / `LinkDeviceSheet.ets` / `StatusComposerSheet.ets` | Floating compose, device link, status composer. |
+| `services/WhatsAppStore.ets` | Sample content for the preview shell. |
+| `services/Pkce.ets`, `AuthStore.ets`, `OAuthConfigStore.ets`, `OAuthFlowStore.ets`, `WhatsAppOAuth.ets` | OAuth 2.0 PKCE stack. |
+| `services/CdpBridge.ets`, `CallService.ets`, `server-go/` | The optional native WhatsApp engine/backend. |
+| `services/PasskeyBridge.ets` | Bridge config + LAN client used by the WebView shim. |
+| `bridge/agent.js` | PC-side Chrome CDP passkey bridge. |
 
-## Capabilities (honest)
+## Live vs preview
 
-| Feature | Status |
-|---|---|
-| QR pairing in-app (scan with phone) | ✅ live-validated |
-| Phone-number 8-char code pairing + country code | ✅ (`/pair-code` + on-screen code with country prefix) |
-| Provisioning QR (air-gapped / per-customer) | ✅ (`whatisit://provision` deep link + QR) |
-| Passkey (SHORTCAKE) linking | 🟡 server + app flow done; on-device WebAuthn needs SDK Credential Manager (manual-paste dev fallback) |
-| Chat list, 1:1 + group text | ✅ |
-| Instant send, replies, reactions, mark-read | ✅ |
-| Delivery / read ticks | ✅ (server receipt events → WS) |
-| Media send + receive (image/video/audio/doc) | ✅ (cached server-side) |
-| Full chat history at link | ✅ when you pick "full history" at pairing — history sync is ingested + persisted |
-| History survives server restarts | ✅ auto-flush every 5s + flush on graceful shutdown (was previously lost) |
-| Chronological message ordering | ✅ time-sorted store (order independent of arrival) |
-| Older-history on-demand backfill | ✅ `/history/backfill` (WhatsApp Web's "scroll up" equivalent) |
-| Persistent session (no re-link) | ✅ SQLite + server keepalive |
-| Status tab (recent updates) | ✅ live status posts from `status@broadcast`; **ephemeral — not backfilled by history sync** |
-| Channels tab | ✅ subscribed channels + channel directory (find/follow/unfollow) |
-| Communities | ❌ not on the protocol surface |
-| WhatsApp-native voice calls | 🟡 meowcaller bridge implemented + compiles; **not yet live-validated** |
-| WhatsApp-native video calls | 🟡 H.264 via native `call_media` encode/decode; meowcaller video path unproven — test after voice |
+- **Preview** — the app ships with realistic sample chats, statuses, calls and
+  communities. Every screen is navigable; sending a message adds a local bubble.
+- **Live** — when a WhatsApp engine/backend is linked, `Index.ets` polls
+  `/status` and replaces the sample chats/messages/statuses/channels/calls with
+  live data. Calls and status posts use the existing `CallService` and
+  `CdpBridge` endpoints.
+- **Calls** — incoming calls now show a full-screen ringing sheet with
+  Accept/Decline and hand off to the native `CallSurfaceView`; call history and
+  missed calls come from the engine. Harbour-whatsapp is used as the feature/UX
+  reference, not as a QML/Sailfish dependency.
+- **Live engine** — native live data needs a running `server-go` (or the
+  embedded `libwa_engine.so`, which is not built yet). Open
+  **Settings → Live engine**, enter the host/port (and token if set), and tap
+  **Save & connect**. Then use **Settings → Link a device** to scan the QR or
+  request an 8-character code. Once linked, `/status` reports `linked` and the
+  shell replaces the sample data with live chats, messages, statuses, calls and
+  channels.
+- **WhatsApp Web** — the official web login is always available as a fallback;
+  its session lives in ArkWeb storage and is independent of the native shell.
+  It cannot feed the native Chats/Calls data.
 
-## Sync & history (how it works now)
+The embedded engine is built separately from the HAP:
 
-- **History arrives from the phone, not the server.** WhatsApp only pushes a
-  `HistorySync` when a device is linked and you choose how much to include
-  (24h / 6 months / full). There is no server-side "fetch all history" API in
-  this whatsmeow build, so:
-  - to get the full backlog, **re-link and pick "full history"** at pairing;
-  - `server-go/history.json` is written from whatever the phone sent, and the
-    linked-device QR code is shown in-app whenever the server is unlinked.
-- **Ordering is chronological.** Messages are inserted time-sorted (deduped by
-  ID), so chat previews, threads and the chat list stay correct no matter what
-  order the phone delivers them in.
-- **Everything persists.** The store auto-flushes every 5s (and on shutdown),
-  so live messages survive a crash/restart — previously they were lost.
-- **Full history is served.** `/messages?chat=` returns the whole stored thread
-  by default (up to a 5,000-message cap), optional `limit=`.
-- **Older messages can be walked back on demand.** `POST /history/backfill
-  {chat, count}` asks the phone for messages older than the oldest one the
-  server holds (the same peer-data mechanism WhatsApp Web uses when scrolling
-  up). The reply arrives as a normal history sync and is ingested into the
-  store.
-- **Statuses are live-only.** Status posts arrive as ephemeral messages in
-  `status@broadcast`; the phone does not include them in history sync. The
-  Status tab shows posts that happen while the server is connected, plus any
-  `status@broadcast` messages present in a history sync (they are ingested as
-  the latest per contact).
+- `server/` is the shared `whatsapp-rust` engine (also runnable over HTTP for
+  Phase 0a).
+- `engine/` is the NAPI cdylib; `.github/workflows/build-engine.yml` builds
+  `libwa_engine.so` for `aarch64-unknown-linux-ohos`.
+- Drop the artifact into `entry/libs/arm64-v8a/libwa_engine.so`; CMake links
+  it through `wa_bridge.cpp`. See [engine/README.md](engine/README.md).
 
-## Testing done vs. what the emulator cannot test
+To run the engine on a PC/VPS:
 
-**Done on the HarmonyOS emulator (+ a real WhatsApp account):**
-QR link with full-history sync (22 conversations / 4,154 messages ingested and
-served time-ordered), live messaging, persistence across server restarts,
-chats/channels/status rendering, backfill request handshake.
-
-**Cannot be validated on the emulator — needs a real device:**
-- WhatsApp-native voice/video calls end-to-end (meowcaller signalling, H.264
-  encode/decode, PiP, camera/mic capture) — the bridge compiles but is unproven.
-- On-device passkey WebAuthn (the SDK has no Credential Manager; the app falls
-  back to pasting a JSON assertion).
-- System push notifications while the app is backgrounded/killed.
-- Real hardware battery/keepalive behaviour and screen-off behaviour.
-- Large-scale media (multi-GB transfers, GPU-accelerated rendering of many
-  videos), and scrolling very long threads (10k+ messages).
-- SMS/phone-number 8-char pairing against a live SIM on a physical handset.
-
-## Backends
-
-### server-go (current)
-Wire-compatible port of the original Rust `server/` to **Go** on `whatsmeow` + `meowcaller`. See `server-go/README.md` for details.
-
-### WhatsMiau Adapter (experimental)
-A thin Go adapter that sits in front of [WhatsMiau](https://github.com/verbeux-ai/whatsmiau), translating its Evolution API-compatible routes and webhooks into the custom API the app expects. See `adapter/README.md` for architecture, run instructions, and Docker Compose.
-
-> **Note**: the adapter does not yet proxy WhatsApp-native calls or the full SHORTCAKE passkey ceremony. Use `server-go` if you need those features.
-
-## Build & run
-
-**server-go backend:**
 ```bash
 cd server-go
-go build ./... && go test ./...   # needs Go >= 1.25 (auto-downloads)
-go run ./cmd/server               # starts :18770 (see server-go/README.md)
+WHATSAPP_TOKEN=change-me PORT=18770 go run ./cmd/server
 ```
 
-**WhatsMiau + Adapter backend:**
-```bash
-# 1. Start WhatsMiau
-cd server-whatsmiau
-cp .env.example .env
-go mod tidy
-go run main.go                    # starts :8080
+Use the PC/VPS LAN or public address in **Settings → Live engine**. The session
+lives on that host, so it must stay running; see [server-go/DEPLOY.md](server-go/DEPLOY.md).
 
-# 2. Start adapter
-cd adapter
-go mod tidy
-go run main.go                    # starts :18770
-```
+For a passkey-protected account, also configure **Settings → Passkey bridge**.
+The native link sheet now requests the WebAuthn assertion from the PC bridge,
+posts it to `/passkey/assertion`, and confirms the code WhatsApp returns. The
+server installs the passkey answer channel in `server-go/client.go`.
 
-Or with Docker Compose:
-```bash
-docker compose -f docker-compose.adapter.yml up -d --build
-```
+## ZapFast
 
-**App:**
-```bash
-oniro-app lint --files entry/src/main/ets/**
-oniro-app build
-oniro-app app apply
-oniro-app app launch
-```
-
-> Note: the app build requires the HarmonyOS SDK (DevEco command-line-tools +
-> SDK components). The Go backends build anywhere with Go 1.25+ (pure Go, no
-> CGO).
-
-## Deploy
-
-See `server-go/DEPLOY.md` — free VPS (GCP e2-micro), Docker or systemd, Caddy/
-Cloudflare Tunnel for TLS. The app's `ServerConfig.BACKEND_HOST` (or the
-hidden `backend_host` pref) points at the server.
-
-For the WhatsMiau + Adapter stack, use `docker-compose.adapter.yml` and point
-the app at the adapter host on port 18770.
+[`ZapFast/`](ZapFast/README.md) holds the native Rust and egui WhatsApp client
+ported to HarmonyOS. It keeps ZapFast's own engine, archive and interface and
+draws them into an ArkUI XComponent, rather than reimplementing the client in
+ArkTS. The HarmonyOS project, build steps and known gaps are in
+[`ZapFast/harmonyos/README.md`](ZapFast/harmonyos/README.md); the signing notes
+are in [`ZapFast/harmonyos/SIGNING.md`](ZapFast/harmonyos/SIGNING.md).
 
 ## Notes
 
-- **Single account per server** — one linked WhatsApp number per instance.
-  Multi-user on a shared VPS IP is a ban risk (the same verdict as before).
-- **Unofficial client** — using custom WhatsApp clients may violate Meta's
-  ToS and could result in account suspension. Use at your own risk.
-- **No browser, no Chrome, no container, no Jitsi** — the CDP/real-Chrome path
-  and the Jitsi fallback are fully removed; calls are WhatsApp-native through
-  the Go backend.
+- **Unofficial client** — using custom WhatsApp clients may violate Meta's Terms
+  of Service and can result in account suspension. Use at your own risk.
+- The design and the PKCE helper are adapted from the
+  [Harmony X](https://github.com/haohaoai0/HarmonyX) project (Apache-2.0);
+  WhatIsIt keeps its own identity, WhatsApp palette and functionality.
+- Backend/deployment notes from the native protocol implementation are kept in
+  [README-SERVER.md](README-SERVER.md).

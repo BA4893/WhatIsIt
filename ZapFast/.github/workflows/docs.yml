@@ -1,0 +1,33 @@
+name: Docs
+
+# The stable site at / is built from the newest release tag and /next/
+# from main (jekyll_vitepress.versions in docs/_config.yml), so a release
+# tag deploys too. Path filters do not apply to tag pushes.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - docs/**
+      - .github/workflows/docs.yml
+      - .github/scripts/indexnow.rb
+  release:
+    types: [published]
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  # Builds with JEKYLL_ENV=production, which turns on analytics
+  # (docs/_includes/jekyll_vitepress/head_end.html), so a local
+  # `jekyll serve` does not report visits.
+  docs:
+    uses: crmne/jekyll-vitepress-theme/.github/workflows/publish-docs.yml@v1

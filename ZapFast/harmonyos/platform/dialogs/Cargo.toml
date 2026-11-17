@@ -1,0 +1,17 @@
+[package]
+name = "zapfast-platform-dialogs"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "The rfd surface ZapFast uses: the desktop crate itself, or HarmonyOS pickers that cancel until their bridge lands"
+
+[lib]
+name = "rfd"
+path = "src/lib.rs"
+
+[target.'cfg(not(target_env = "ohos"))'.dependencies]
+upstream = { package = "rfd", version = "0.17", default-features = false, features = ["xdg-portal", "wayland"] }
+
+[target.'cfg(target_env = "ohos")'.dependencies]
+log = "0.4"

@@ -1,5 +1,7 @@
 {
   "src": [
-    "pages/MainPage"
+    "pages/Index",
+    "pages/HybridShell",
+    "pages/OAuthCallback"
   ]
 }

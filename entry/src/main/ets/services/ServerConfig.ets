@@ -1,9 +1,10 @@
 /**
- * ServerConfig — hidden background configuration.
+ * ServerConfig — compile-time backend defaults.
  *
- * No user-facing plumbing: the backend endpoint is baked in here
- * (compile-time constant), never exposed in the UI. This matches the product
- * rule that server/endpoint configuration lives entirely in background code.
+ * These are the *defaults* only. The app can override host/port/token at
+ * runtime through the hidden "Server" card on the connect screen, or through
+ * a `whatisit://provision` deep link. The override is persisted in the
+ * `whatisit_cdp` preferences file and wins over these constants.
  */
 export class ServerConfig {
   /**
@@ -21,6 +22,9 @@ export class ServerConfig {
 
   /** Preference key for the hidden persisted host override. */
   static readonly BACKEND_HOST_PREF: string = 'backend_host';
+
+  /** Preference key for the hidden persisted port override. */
+  static readonly BACKEND_PORT_PREF: string = 'backend_port';
 
   /** Preference key for the hidden persisted token override. */
   static readonly BACKEND_TOKEN_PREF: string = 'backend_token';

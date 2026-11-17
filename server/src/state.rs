@@ -49,6 +49,18 @@ pub enum Event {
     PasskeyError { error: String },
 }
 
+/// One call-history row served by `/calls`.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CallLogEntry {
+    pub id: String,
+    pub peer: String,
+    pub dir: String,
+    pub video: bool,
+    pub missed: bool,
+    pub time: i64,
+    pub name: String,
+}
+
 /// The server's mutable state, shared across the bot callbacks and HTTP handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -70,6 +82,8 @@ pub struct AppState {
     /// Resolves a pending passkey ceremony with the app's assertion (or cancel).
     /// `None` when no passkey ceremony is waiting.
     pub passkey_answer: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<PasskeyAnswer>>>>,
+    /// Recent call rows for the app's Calls tab.
+    pub call_log: Arc<std::sync::Mutex<Vec<CallLogEntry>>>,
 }
 
 impl AppState {
@@ -86,7 +100,24 @@ impl AppState {
             pair_code: Arc::new(std::sync::Mutex::new(String::new())),
             passkey_pending: Arc::new(std::sync::Mutex::new(None)),
             passkey_answer: Arc::new(std::sync::Mutex::new(None)),
+            call_log: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
+    }
+
+    /// Append a call row; keeps the newest 200.
+    pub fn add_call(&self, entry: CallLogEntry) {
+        if let Ok(mut log) = self.call_log.lock() {
+            log.insert(0, entry);
+            log.truncate(200);
+        }
+    }
+
+    /// Newest-first call history for `/calls`.
+    pub fn calls(&self) -> Vec<CallLogEntry> {
+        self.call_log
+            .lock()
+            .map(|log| log.clone())
+            .unwrap_or_default()
     }
 
     pub fn is_linked(&self) -> bool {

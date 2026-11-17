@@ -1,0 +1,17 @@
+[package]
+name = "zapfast-platform-shell"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "The fastframe-shell surface ZapFast uses: the desktop crate itself, or the HarmonyOS XComponent host decisions"
+
+[lib]
+name = "fastframe_shell"
+path = "src/lib.rs"
+
+[target.'cfg(not(target_env = "ohos"))'.dependencies]
+upstream = { package = "fastframe-shell", git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
+
+[target.'cfg(target_env = "ohos")'.dependencies]
+egui = "0.36.2"

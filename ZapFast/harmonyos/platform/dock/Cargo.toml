@@ -1,0 +1,14 @@
+[package]
+name = "zapfast-platform-dock"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "The fastframe-dock surface ZapFast uses: the desktop crate itself, or the HarmonyOS launcher badge stand-in"
+
+[lib]
+name = "fastframe_dock"
+path = "src/lib.rs"
+
+[target.'cfg(not(target_env = "ohos"))'.dependencies]
+upstream = { package = "fastframe-dock", git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }

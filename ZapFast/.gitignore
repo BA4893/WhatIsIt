@@ -1,0 +1,29 @@
+/target/
+**/target/
+.idea/
+.vscode/
+.claude/
+.direnv/
+
+/.cache/
+
+/dist/
+
+/packaging/flatpak/built/
+/packaging/flatpak/cargo-sources.json
+/packaging/flatpak/flatpak-cargo-generator.py
+/.flatpak-builder/
+/build-dir/
+
+# HarmonyOS build outputs (the HAP, its caches, and the Rust static library
+# copied into the app by harmonyos/build.sh).
+/harmonyos/.hvigor/
+/harmonyos/oh_modules/
+/harmonyos/build/
+/harmonyos/entry/build/
+/harmonyos/entry/.cxx/
+/harmonyos/entry/libs/
+/harmonyos/entry/oh_modules/
+
+# Signing material: keep it backed up outside the repository.
+/harmonyos/signing/

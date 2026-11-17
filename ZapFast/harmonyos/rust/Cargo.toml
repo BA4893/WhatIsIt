@@ -1,0 +1,34 @@
+[package]
+name = "zapfast-ohos"
+version = "0.21.2"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "The HarmonyOS host for ZapFast: XComponent surface, EGL/GLES3 rendering, input bridge and frame loop"
+
+[lib]
+name = "zapfast_ohos"
+path = "src/lib.rs"
+# A static library linked into the app's C++ NAPI module, and an rlib so the
+# offscreen screenshot tool can share the renderer.
+crate-type = ["staticlib", "rlib"]
+
+# Offline sample chats, for the screenshot tool and layout checks.
+[features]
+demo = ["zapfast/demo"]
+
+[dependencies]
+zapfast = { path = "../.." }
+fastframe-shell = { package = "zapfast-platform-shell", path = "../platform/shell" }
+zapfast-ohos-keyring = { path = "../keyring" }
+egui = "0.36.2"
+egui_glow = "0.36.2"
+glow = "0.17"
+libc = "0.2"
+log = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[[bin]]
+name = "zapfast-ohos-shot"
+path = "src/bin/ohos-shot.rs"
+required-features = ["demo"]

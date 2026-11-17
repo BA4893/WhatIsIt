@@ -1,88 +1,114 @@
-import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
+import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { preferences } from '@kit.ArkData';
 import { window } from '@kit.ArkUI';
-import { CdpBridge } from './../services/CdpBridge';
+import { webview } from '@kit.ArkWeb';
+import { AppearanceStore } from '../services/AppearanceStore';
+import { ResponsiveLayout } from '../services/ResponsiveLayout';
+import { oauthFlowStore } from '../services/OAuthFlowStore';
+import { OAUTH_REDIRECT_URI } from '../services/WhatsAppOAuth';
 
 const DOMAIN = 0x0000;
+const TAG = 'EntryAbility';
+const BREAKPOINT_KEY: string = 'whatisit.breakpoint';
 
 export default class EntryAbility extends UIAbility {
-  private provisioningHost: string = '';
-  private provisioningPort: number = 0;
+  private windowStage: window.WindowStage | null = null;
+  private callbackUri: string = '';
+  private appearance: AppearanceStore = new AppearanceStore();
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    hilog.info(DOMAIN, TAG, 'onCreate');
+    const mode = this.appearance.load(this.context);
     try {
-      this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
-    } catch (err) {
-      hilog.error(DOMAIN, 'testTag', 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
+      this.context.getApplicationContext().setColorMode(this.appearance.colorMode(mode));
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'setColorMode failed: %{public}s', JSON.stringify(e));
     }
-    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
-    this.provisioningHost = '';
-    this.provisioningPort = 0;
-    const provision = CdpBridge.parseProvisionUrl(want.uri || '');
-    if (provision !== null) {
-      this.provisioningHost = provision.host;
-      this.provisioningPort = provision.port;
-      hilog.info(DOMAIN, 'testTag', 'provisioning from deep link: %{public}s:%{public}d', provision.host, provision.port);
-      preferences.getPreferences(this.context, 'whatisit_cdp').then((prefs) => {
-        prefs.put('provision_host', provision.host).catch(() => {});
-        prefs.put('provision_port', String(provision.port)).catch(() => {});
-        prefs.put('provision_pending', 'true').catch(() => {});
-      }).catch(() => {});
+    try {
+      webview.WebviewController.setUserAgentClientHintsEnabled(false);
+      webview.WebviewController.initializeWebEngine();
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'ArkWeb init failed: %{public}s', JSON.stringify(e));
     }
+    AppStorage.setOrCreate<string>(BREAKPOINT_KEY, ResponsiveLayout.BREAKPOINT_SM);
+    AppStorage.setOrCreate<boolean>('whatisit.notifications', true);
+    AppStorage.setOrCreate<boolean>('whatisit.read_receipts', true);
+    this.readCallback(want);
   }
 
-  /** App Continuation: package the current chat/view into the migration want. */
-  onContinue(wantParam: Record<string, Object>): AbilityConstant.OnContinueResult {
-    try {
-      // Read the shell's current state (persisted on navigation) and carry it.
-      const options: preferences.Options = { name: 'whatisit_cdp' };
-      const store = preferences.getPreferencesSync(this.context, options);
-      const chat = store.getSync('current_chat', '') as string;
-      const view = store.getSync('current_view', '') as string;
-      if (chat.length > 0) {
-        wantParam['chatName'] = chat;
-      }
-      if (view.length > 0) {
-        wantParam['view'] = view;
-      }
-      hilog.info(DOMAIN, 'testTag', 'onContinue: chat=%{public}s view=%{public}s', chat, view);
-      return AbilityConstant.OnContinueResult.AGREE;
-    } catch (err) {
-      hilog.warn(DOMAIN, 'testTag', 'onContinue failed: %{public}s', JSON.stringify(err));
-      return AbilityConstant.OnContinueResult.REJECT;
+  onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    this.callbackUri = '';
+    this.readCallback(want);
+    if (this.callbackUri.length > 0 && this.windowStage !== null) {
+      this.openCallback(this.windowStage, this.callbackUri);
     }
-  }
-
-  onDestroy(): void {
-    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onDestroy');
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
-    // Main window is created, set main page for this ability
-    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onWindowStageCreate');
-
-    windowStage.loadContent('pages/MainPage', (err) => {
+    this.windowStage = windowStage;
+    if (this.callbackUri.length > 0) {
+      this.openCallback(windowStage, this.callbackUri);
+      return;
+    }
+    windowStage.loadContent('pages/HybridShell', (err) => {
       if (err.code) {
-        hilog.error(DOMAIN, 'testTag', 'Failed to load the content. Cause: %{public}s', JSON.stringify(err));
+        hilog.error(DOMAIN, TAG, 'load HybridShell failed: %{public}s', JSON.stringify(err));
         return;
       }
-      hilog.info(DOMAIN, 'testTag', 'Succeeded in loading the content.');
+      this.observeWindow(windowStage);
     });
   }
 
+  private async openCallback(windowStage: window.WindowStage, uri: string): Promise<void> {
+    const saved = await oauthFlowStore.saveCallback(this.context, uri);
+    if (!saved) {
+      hilog.error(DOMAIN, TAG, 'could not save OAuth callback');
+    }
+    windowStage.loadContent('pages/OAuthCallback', (err) => {
+      if (err.code) {
+        hilog.error(DOMAIN, TAG, 'load OAuthCallback failed: %{public}s', JSON.stringify(err));
+        return;
+      }
+      this.observeWindow(windowStage);
+    });
+  }
+
+  private readCallback(want: Want): void {
+    const uri = want.uri === undefined ? '' : want.uri;
+    if (uri.startsWith(OAUTH_REDIRECT_URI)) {
+      this.callbackUri = uri;
+      hilog.info(DOMAIN, TAG, 'OAuth callback received');
+    }
+  }
+
+  private observeWindow(windowStage: window.WindowStage): void {
+    try {
+      const mainWindow = windowStage.getMainWindowSync();
+      const uiContext = mainWindow.getUIContext();
+      const width = uiContext.px2vp(mainWindow.getWindowProperties().windowRect.width);
+      AppStorage.setOrCreate<string>(BREAKPOINT_KEY, ResponsiveLayout.breakpointForWidth(width));
+      mainWindow.on('windowSizeChange', (size: window.Size) => {
+        const widthVp = uiContext.px2vp(size.width);
+        AppStorage.setOrCreate<string>(BREAKPOINT_KEY, ResponsiveLayout.breakpointForWidth(widthVp));
+      });
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'observeWindow failed: %{public}s', JSON.stringify(e));
+    }
+  }
+
   onWindowStageDestroy(): void {
-    // Main window is destroyed, release UI related resources
-    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onWindowStageDestroy');
+    this.windowStage = null;
   }
 
   onForeground(): void {
-    // Ability has brought to foreground
-    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onForeground');
+    hilog.info(DOMAIN, TAG, 'onForeground');
   }
 
   onBackground(): void {
-    // Ability has back to background
-    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onBackground');
+    hilog.info(DOMAIN, TAG, 'onBackground');
+  }
+
+  onDestroy(): void {
+    hilog.info(DOMAIN, TAG, 'onDestroy');
   }
 }

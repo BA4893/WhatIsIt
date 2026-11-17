@@ -1,0 +1,9 @@
+{
+  "name": "entry",
+  "version": "0.21.2",
+  "description": "ZapFast's HarmonyOS entry module",
+  "main": "",
+  "author": "ZapFast",
+  "license": "MIT",
+  "dependencies": {}
+}

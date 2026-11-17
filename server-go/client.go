@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -238,8 +239,42 @@ func (wc *WAClient) onPasskeyRequest(e *events.PairPasskeyRequest) {
 		return
 	}
 	opts := mustJSON(e.PublicKey)
+	// Install the answer channel before publishing the request. Without this,
+	// /passkey/assertion finds no pending ceremony and returns 409, leaving the
+	// companion link stalled.
+	answer := wc.state.InstallPasskeyAnswer()
+	go wc.awaitPasskeyAnswer(answer)
 	wc.state.SetPasskeyPending(opts)
 	wc.state.Bus.Publish(EvPasskeyReq(opts))
+}
+
+// awaitPasskeyAnswer turns the app's WebAuthn assertion into a whatsmeow
+// SendPasskeyResponse. WhatsApp then sends PairPasskeyConfirmation, which the
+// event handler publishes as passkey_confirmation.
+func (wc *WAClient) awaitPasskeyAnswer(answer chan PasskeyAnswer) {
+	timer := time.NewTimer(5 * time.Minute)
+	defer timer.Stop()
+	select {
+	case ans := <-answer:
+		if ans.Cancelled || ans.Assertion == nil {
+			return
+		}
+		var resp types.WebAuthnResponse
+		if err := json.Unmarshal(ans.Assertion.AssertionJSON, &resp); err != nil {
+			log.Printf("passkey assertion JSON: %v", err)
+			wc.state.Bus.Publish(EvPasskeyErr("invalid passkey assertion: " + err.Error()))
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+		if err := wc.PasskeyResponse(ctx, &resp); err != nil {
+			log.Printf("send passkey response: %v", err)
+			wc.state.Bus.Publish(EvPasskeyErr(err.Error()))
+		}
+	case <-timer.C:
+		wc.state.Bus.Publish(EvPasskeyErr("passkey request timed out"))
+		wc.state.TakePasskeyPending()
+	}
 }
 
 // PasskeyResponse sends the app's WebAuthn assertion to complete the ceremony.

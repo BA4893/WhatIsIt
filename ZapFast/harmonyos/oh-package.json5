@@ -1,0 +1,8 @@
+{
+  "modelVersion": "6.1.0",
+  "name": "zapfast-ohos",
+  "version": "0.21.2",
+  "description": "ZapFast, a native WhatsApp client, in a HarmonyOS XComponent",
+  "dependencies": {
+  }
+}

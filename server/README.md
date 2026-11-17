@@ -38,6 +38,7 @@ Env vars:
 GET  /status         {linked, phone, qr}
 POST /pair           start QR pairing (no-op when linked)
 GET  /chats          [{id, name, preview, time, unread, pinned}]
+GET  /calls          [{id, peer, dir, video, missed, time, name}]
 GET  /messages?chat= [{id, text, dir, time, status, replyTo, reactions, media}]
 POST /send           {chat, text, replyTo?}
 POST /send-media     multipart {chat, file, caption?}

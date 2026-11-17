@@ -1,0 +1,11 @@
+[package]
+name = "zapfast-ohos-keyring"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "ZapFast's archive key store on HarmonyOS, kept in the app's private sandbox"
+
+[dependencies]
+keyring-core = "1"
+log = "0.4"

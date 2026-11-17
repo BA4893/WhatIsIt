@@ -1,0 +1,2369 @@
+//! A repeatable tour driven through the real pointer and keyboard handlers.
+
+mod calls;
+mod capture;
+mod feeds;
+pub(super) mod media;
+mod session;
+mod whats_new;
+mod whats_new_21;
+
+pub use capture::Capture;
+pub use session::respond;
+
+use crate::{
+    app::App,
+    model::{Content, Page, StickerShelf},
+    settings::ThemeChoice,
+    ui::focus::Stop,
+};
+use egui::{Event, Key, Modifiers, PointerButton, Pos2, Rect, pos2, vec2};
+use serde::Serialize;
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+const PHOTO_CAPTION: &str = "Launch day ⚡";
+/// Length of the input-driven launch tour, excluding its optional start delay.
+pub const DURATION: Duration = Duration::from_secs(41);
+
+/// Which scripted tour to play.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Script {
+    /// The 41-second launch tour: search, replies, GIFs, stickers, themes.
+    #[default]
+    Launch,
+    /// What ZapFast 0.16 added, about 90 seconds.
+    WhatsNew,
+    /// A one-to-one video call, a voice call answered, and a group's video
+    /// call, about 40 seconds.
+    Calls,
+    /// What ZapFast 0.21 added, about 45 seconds.
+    WhatsNew21,
+}
+
+impl Script {
+    /// Names accepted by `--demo-tour-script`.
+    pub const NAMES: [&str; 4] = ["launch", "whats-new", "calls", "whats-new-21"];
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "launch" => Some(Self::Launch),
+            "whats-new" => Some(Self::WhatsNew),
+            "calls" => Some(Self::Calls),
+            "whats-new-21" => Some(Self::WhatsNew21),
+            _ => None,
+        }
+    }
+
+    /// Length of the tour, excluding its optional start delay.
+    pub fn duration(self) -> Duration {
+        match self {
+            Self::Launch => DURATION,
+            Self::WhatsNew => whats_new::DURATION,
+            Self::Calls => calls::DURATION,
+            Self::WhatsNew21 => whats_new_21::DURATION,
+        }
+    }
+
+    /// Sets up the opening shot. Call only on an app populated with demo data.
+    pub fn prepare(self, app: &mut App) {
+        match self {
+            Self::Launch => prepare(app),
+            Self::WhatsNew => whats_new::prepare(app),
+            Self::Calls => calls::prepare(app),
+            Self::WhatsNew21 => whats_new_21::prepare(app),
+        }
+    }
+
+    fn cues(self) -> Vec<Cue> {
+        match self {
+            Self::Launch => script(),
+            Self::WhatsNew => whats_new::script(),
+            Self::Calls => calls::script(),
+            Self::WhatsNew21 => whats_new_21::script(),
+        }
+    }
+
+    /// Wheel scrolls over the transcript: from, until, and points a second.
+    fn scrolls(self) -> &'static [(f32, f32, f32)] {
+        match self {
+            Self::Launch => &[(3.6, 4.6, 340.0)],
+            Self::WhatsNew | Self::Calls | Self::WhatsNew21 => &[],
+        }
+    }
+}
+
+/// Sets up the launch tour's opening shot. Call only on an app populated
+/// with demo data.
+pub fn prepare(app: &mut App) {
+    common_setup(app);
+    super::apply_flags(app, Some("voice"));
+    show_photos(app, super::stock::LAUNCH, PHOTO_CAPTION);
+    if let Some(quote) = app
+        .conversations
+        .get_mut(super::SAMPLES[0].id)
+        .and_then(|chat| chat.message_mut("ada-reply"))
+        .and_then(|row| row.quoted.as_mut())
+    {
+        quote.summary = "Voice message (0:06)".into();
+    }
+    // Keep the launch footage focused on this app.
+    if let Some(row) = app
+        .conversations
+        .get_mut(super::SAMPLES[0].id)
+        .and_then(|chat| chat.message_mut("ada-link"))
+    {
+        row.content = Content::text("The desktop app is ready! https://zapfast.rocks");
+        row.thumbnail = None;
+        let summary = row.summary();
+        if let Some(last) = app.chats.first_mut().and_then(|chat| chat.last.as_mut()) {
+            last.summary = summary;
+        }
+    }
+}
+
+/// The state every tour opens from: offline, dark, the first chat open, and
+/// local stickers and GIFs in place of downloads.
+fn common_setup(app: &mut App) {
+    assert!(app.backend.is_offline(), "a tour requires an offline app");
+    // `ZAPFAST_DEMO_FONT=inter` draws the tour in the bundled Inter, the same
+    // on every machine, instead of the platform's font.
+    if std::env::var("ZAPFAST_DEMO_FONT").is_ok_and(|font| font.eq_ignore_ascii_case("inter")) {
+        app.settings.font = crate::settings::FontChoice::Inter;
+    }
+    app.settings.theme = ThemeChoice::Dark;
+    app.settings.keep_running_in_background = false;
+    app.page = Page::Chats;
+    app.dialog = None;
+    app.picker = None;
+    app.search.clear();
+    app.search_hits.clear();
+    app.composer.clear();
+    app.drafts.clear();
+    app.reply_to = None;
+    app.typing.clear();
+    app.actions.clear();
+    app.open_chat = Some(super::SAMPLES[0].id.to_owned());
+    app.scroll_to_bottom = true;
+    app.scroll_anchor = None;
+    app.focus_composer = false;
+    app.sidebar_visible = true;
+    app.show_archived = false;
+    app.backend.record_demo_commands();
+    media::populate(app).expect("bundled demo media");
+    let saved_sticker = app.stickers_saved.first().cloned();
+    if let Some(row) = app
+        .conversations
+        .get_mut(super::SAMPLES[0].id)
+        .and_then(|chat| chat.message_mut("ada-sticker"))
+        && let Content::Sticker { media, animated } = &mut row.content
+    {
+        media.path = saved_sticker;
+        *animated = false;
+    }
+}
+
+/// Shows fully loaded photos, `photo` with `caption` as Ada's, instead of
+/// the deliberately blurry download previews used by the screenshot fixtures.
+fn show_photos(app: &mut App, photo: super::stock::Photo, caption: &str) {
+    let dir = app.dirs.media_cache_dir();
+    for (chat, id, photo, caption) in [
+        (super::SAMPLES[0].id, "ada-photo", photo, caption),
+        (
+            super::SAMPLES[1].id,
+            "group-photo",
+            super::stock::VENUE,
+            "Tonight's meetup, doors at 18:30",
+        ),
+    ] {
+        if let Some(row) = app
+            .conversations
+            .get_mut(chat)
+            .and_then(|chat| chat.message_mut(id))
+            && let Content::Image {
+                media,
+                caption: text,
+                ..
+            } = &mut row.content
+        {
+            media.path = Some(super::stock::save_photo(&dir, photo));
+            media.width = Some(photo.width);
+            media.height = Some(photo.height);
+            row.thumbnail = Some(super::stock::thumbnail(photo));
+            *text = Some(caption.to_owned());
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Target {
+    Label(&'static str),
+    Widget(&'static str),
+    Bubble(&'static str),
+    /// Inside a bubble's lower corner, in its margin, clear of the text and
+    /// media that take clicks for themselves.
+    BubbleCorner(&'static str),
+    Picker,
+    Gif,
+    Sticker,
+    /// An icon control without text, by its place in the Tab order.
+    Stop(Stop),
+    /// The chat search calendar's day of the newest result.
+    NewestHitDay,
+    /// The oldest result in the chat search pane.
+    OldestHit,
+    /// A sticker shelf tab: 0 recent, 1 favorites, then the packs.
+    Shelf(usize),
+    /// An icon button without text, by its tooltip.
+    Button(&'static str),
+    /// The reactions under a message in the open chat.
+    Reactions(&'static str),
+}
+
+enum Gesture {
+    Key(Key, Modifiers, &'static str),
+    /// A key without a caption, for editing text.
+    Press(Key, Modifiers),
+    Text(char),
+    Move(Target),
+    Click(PointerButton),
+    /// A click with modifiers held, captioned.
+    ClickWith(PointerButton, Modifiers, &'static str),
+    /// Turns the wheel where the pointer is, by points; negative scrolls down.
+    Wheel(f32),
+    /// What the other side of a call or the network does, which no input
+    /// here causes: the demo backend's part, delivered as the worker would.
+    Remote(fn(&mut App)),
+    /// Drops files from the tour's media folder where the pointer is,
+    /// captioned.
+    Drop(&'static [&'static str], &'static str),
+}
+
+struct Cue {
+    at: f32,
+    gesture: Gesture,
+}
+
+fn command() -> Modifiers {
+    Modifiers {
+        command: true,
+        ctrl: !cfg!(target_os = "macos"),
+        mac_cmd: cfg!(target_os = "macos"),
+        ..Modifiers::NONE
+    }
+}
+
+fn script() -> Vec<Cue> {
+    use Gesture::*;
+    use Target::*;
+    let mut cues = Vec::new();
+    let mut add = |at, gesture| cues.push(Cue { at, gesture });
+    let left = PointerButton::Primary;
+    add(0.0, Key(egui::Key::K, command(), "Ctrl + K · Search chats"));
+    add(0.8, Move(Label("Rust Berlin")));
+    add(1.15, Click(left));
+    add(
+        1.7,
+        Key(
+            egui::Key::Escape,
+            Modifiers::NONE,
+            "Esc · Return to the chat",
+        ),
+    );
+    add(
+        2.1,
+        Key(
+            egui::Key::ArrowUp,
+            Modifiers::ALT,
+            "Alt + ↑ · Previous chat",
+        ),
+    );
+    add(
+        2.6,
+        Key(egui::Key::ArrowDown, Modifiers::ALT, "Alt + ↓ · Next chat"),
+    );
+    add(
+        3.1,
+        Key(
+            egui::Key::ArrowUp,
+            Modifiers::ALT,
+            "Alt + ↑ · Previous chat",
+        ),
+    );
+    add(
+        4.8,
+        Key(egui::Key::End, command(), "Ctrl + End · Latest messages"),
+    );
+    add(5.4, Move(Bubble("ada-voice")));
+    add(5.8, Click(PointerButton::Secondary));
+    add(6.25, Move(Label("Reply")));
+    add(6.7, Click(left));
+    add(
+        8.1,
+        Key(egui::Key::Enter, Modifiers::NONE, "Enter · Complete emoji"),
+    );
+    add(
+        8.7,
+        Key(egui::Key::Enter, Modifiers::NONE, "Enter · Send reply"),
+    );
+    add(9.4, Move(Picker));
+    add(9.8, Click(left));
+    add(10.5, Move(Label("GIF")));
+    add(10.9, Click(left));
+    add(11.5, Move(Widget("gif-search")));
+    add(11.9, Click(left));
+    add(
+        12.6,
+        Key(egui::Key::Enter, Modifiers::NONE, "Enter · Search GIFs"),
+    );
+    add(13.3, Move(Gif));
+    add(
+        13.8,
+        Key(egui::Key::Escape, Modifiers::NONE, "Esc · Close GIF search"),
+    );
+    add(15.9, Move(Picker));
+    add(16.3, Click(left));
+    add(17.0, Move(Label("Stickers")));
+    add(17.4, Click(left));
+    add(18.0, Move(Sticker));
+    add(18.5, Click(left));
+    add(
+        20.2,
+        Key(egui::Key::ArrowDown, Modifiers::ALT, "Alt + ↓ · Next chat"),
+    );
+    add(
+        21.6,
+        Key(
+            egui::Key::Enter,
+            Modifiers::NONE,
+            "Enter · Complete mention",
+        ),
+    );
+    add(
+        23.0,
+        Key(egui::Key::Enter, Modifiers::NONE, "Enter · Send message"),
+    );
+    add(
+        24.0,
+        Key(egui::Key::B, command(), "Ctrl + B · Hide chat list"),
+    );
+    add(
+        25.0,
+        Key(egui::Key::B, command(), "Ctrl + B · Show chat list"),
+    );
+    add(26.0, Move(Label("Rust Berlin")));
+    add(26.5, Click(left));
+    add(
+        28.0,
+        Key(egui::Key::Escape, Modifiers::NONE, "Esc · Close group info"),
+    );
+    add(
+        28.6,
+        Key(egui::Key::Slash, command(), "Ctrl + / · Keyboard shortcuts"),
+    );
+    add(
+        31.8,
+        Key(egui::Key::Escape, Modifiers::NONE, "Esc · Close shortcuts"),
+    );
+    add(
+        32.5,
+        Key(egui::Key::Comma, command(), "Ctrl + , · Settings"),
+    );
+    add(33.0, Move(Label("Dark")));
+    add(33.35, Click(left));
+    add(33.5, Move(Label("Light")));
+    add(33.85, Click(left));
+    add(
+        34.5,
+        Key(egui::Key::Escape, Modifiers::NONE, "Esc · Back to chats"),
+    );
+    add(
+        36.0,
+        Key(
+            egui::Key::ArrowUp,
+            Modifiers::ALT,
+            "Alt + ↑ · Previous chat",
+        ),
+    );
+    add(
+        37.5,
+        Key(egui::Key::Comma, command(), "Ctrl + , · Settings"),
+    );
+    add(38.0, Move(Label("Light")));
+    add(38.35, Click(left));
+    add(38.5, Move(Label("Dark")));
+    add(38.85, Click(left));
+    add(
+        39.2,
+        Key(egui::Key::Escape, Modifiers::NONE, "Esc · Back to chats"),
+    );
+    for (start, text) in [
+        (0.2, "Rust"),
+        (7.1, "See you tonight! :smile"),
+        (12.1, "party"),
+        (20.8, "@mi"),
+        (21.9, " see you in the front row!"),
+    ] {
+        for (index, character) in text.chars().enumerate() {
+            cues.push(Cue {
+                at: start + index as f32 * 0.025,
+                gesture: Text(character),
+            });
+        }
+    }
+    cues.sort_by(|a, b| a.at.total_cmp(&b.at));
+    cues
+}
+
+#[derive(Serialize)]
+struct Trace {
+    at: f32,
+    #[serde(flatten)]
+    event: TraceEvent,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum TraceEvent {
+    Pointer {
+        x: f32,
+        y: f32,
+    },
+    Click {
+        x: f32,
+        y: f32,
+        button: &'static str,
+    },
+    Keys {
+        label: String,
+    },
+}
+
+/// Supplies ordinary egui input. The optional trace is rendered onto video later.
+pub struct Tour {
+    script: Script,
+    delay: Option<Duration>,
+    start: Option<Instant>,
+    cues: Vec<Cue>,
+    next: usize,
+    previous: f32,
+    pointer: Pos2,
+    motion: Option<(f32, Pos2, Pos2)>,
+    labels: HashMap<String, Pos2>,
+    trace: Vec<Trace>,
+    trace_path: Option<PathBuf>,
+    saved: bool,
+    failed: bool,
+    capture: Option<capture::Frames>,
+    /// The capture's tour time for the frame in progress.
+    capture_at: Option<f32>,
+    /// Modifier keys held for a click, with its button until released.
+    holding: Option<(Option<PointerButton>, Modifiers)>,
+    /// What a video call's tiles show.
+    feeds: feeds::Feeds,
+}
+
+impl Tour {
+    /// The launch tour.
+    pub fn new(delay: Option<Duration>, trace_path: Option<PathBuf>) -> Self {
+        Self::scripted(Script::Launch, delay, trace_path, None)
+    }
+
+    /// `script`, started by Space or after `delay`, or with `capture`, played
+    /// on a virtual clock and saved frame by frame.
+    pub fn scripted(
+        script: Script,
+        delay: Option<Duration>,
+        trace_path: Option<PathBuf>,
+        capture: Option<Capture>,
+    ) -> Self {
+        let capture = capture.and_then(|capture| match capture::Frames::new(capture) {
+            Ok(frames) => Some(frames),
+            Err(error) => {
+                log::error!("could not start the frame capture: {error:#}");
+                None
+            }
+        });
+        Self {
+            script,
+            delay,
+            start: None,
+            cues: script.cues(),
+            next: 0,
+            previous: 0.0,
+            pointer: pos2(680.0, 440.0),
+            motion: None,
+            labels: HashMap::new(),
+            trace: Vec::new(),
+            trace_path,
+            saved: false,
+            failed: false,
+            capture,
+            capture_at: None,
+            holding: None,
+            feeds: feeds::Feeds::from_env(),
+        }
+    }
+
+    pub fn input(&mut self, app: &mut App, ctx: &egui::Context, input: &mut egui::RawInput) {
+        if let Some(frames) = self.capture.as_mut() {
+            self.capture_at = frames.begin(input);
+            if let Some(at) = self.capture_at {
+                self.input_at(app, ctx, input, at);
+            }
+            return;
+        }
+        let replay = input.events.iter().any(|event| {
+            matches!(event,
+            Event::Key { key: Key::Space, pressed: true, repeat: false, modifiers, .. }
+                if modifiers.is_none())
+        });
+        if replay {
+            input.events.retain(|event| {
+                !matches!(
+                    event,
+                    Event::Key {
+                        key: Key::Space,
+                        ..
+                    } | Event::Text(_)
+                )
+            });
+            super::populate(app);
+            self.script.prepare(app);
+            self.start = Some(Instant::now());
+            self.delay = None;
+            self.next = 0;
+            self.previous = 0.0;
+            self.motion = None;
+            self.trace.clear();
+            self.saved = false;
+            self.failed = false;
+        }
+        if let Some(start) = self.start
+            && Instant::now() >= start
+        {
+            self.input_at(app, ctx, input, start.elapsed().as_secs_f32());
+        }
+    }
+
+    fn target(&self, target: Target, app: &App, ctx: &egui::Context) -> Option<Pos2> {
+        match target {
+            Target::Label(label) => self.labels.get(label).copied(),
+            Target::Widget(id) => ctx
+                .read_response(egui::Id::new(id))
+                .map(|r| r.rect.center()),
+            Target::Bubble(message) => Self::bubble(app, ctx, message).map(|rect| rect.center()),
+            Target::BubbleCorner(message) => {
+                let rect = Self::bubble(app, ctx, message)?;
+                Some(rect.right_bottom() - vec2(5.0, 2.0))
+            }
+            Target::Picker => app.picker_anchor.map(|rect| rect.center()),
+            Target::Gif => ctx
+                .read_response(egui::Id::new("gif-search"))
+                .map(|r| r.rect.left_bottom() + vec2(60.0, 55.0)),
+            Target::Sticker => ctx
+                .data(|d| d.get_temp::<Rect>(crate::ui::picker::first_tile_id()))
+                .map(|rect| rect.center()),
+            Target::Stop(stop) => ctx
+                .read_response(crate::ui::focus::control(ctx, stop)?)
+                .map(|r| r.rect.center()),
+            Target::NewestHitDay => {
+                let day = crate::util::day_key(app.chat_search_hits.first()?.timestamp)?;
+                let id = egui::Id::new(("chat-search-day", day.year(), day.month(), day.day()));
+                ctx.read_response(id).map(|r| r.rect.center())
+            }
+            // The pane's row for the oldest result, by where it was drawn
+            // rather than by its text, which another font may lay out apart.
+            Target::OldestHit => {
+                let key = crate::ui::pane::hit_row_id(&app.chat_search_hits.last()?.id);
+                let row = ctx.data(|data| data.get_temp::<egui::Id>(key))?;
+                ctx.read_response(row).map(|r| r.rect.center())
+            }
+            Target::Shelf(index) => {
+                let shelf = match index {
+                    0 => StickerShelf::Recent,
+                    1 => StickerShelf::Favorites,
+                    pack => StickerShelf::Pack(app.sticker_packs.get(pack - 2)?.dir.clone()),
+                };
+                ctx.data(|d| d.get_temp::<Rect>(crate::ui::picker::shelf_tab_id(&shelf)))
+                    .map(|rect| rect.center())
+            }
+            Target::Button(tooltip) => ctx
+                .read_response(crate::ui::focus::named_button(ctx, tooltip)?)
+                .map(|r| r.rect.center()),
+            Target::Reactions(message) => {
+                let id = crate::ui::conversation::bubble_id(app.open_chat.as_deref()?, message)
+                    .with("reactions");
+                ctx.read_response(id).map(|r| r.rect.center())
+            }
+        }
+    }
+
+    /// The part of a bubble in the open chat that the transcript shows.
+    fn bubble(app: &App, ctx: &egui::Context, message: &str) -> Option<Rect> {
+        let id =
+            crate::ui::conversation::bubble_id(app.open_chat.as_deref()?, message).with("rect");
+        let rect = ctx.data(|d| d.get_temp::<Rect>(id))?;
+        let view = (*app.selection_view.lock().unwrap_or_else(|p| p.into_inner()))?;
+        let rect = rect.intersect(view);
+        rect.is_positive().then_some(rect)
+    }
+
+    fn input_at(
+        &mut self,
+        app: &mut App,
+        ctx: &egui::Context,
+        input: &mut egui::RawInput,
+        at: f32,
+    ) {
+        if self.failed {
+            return;
+        }
+        // The button comes up a frame after it went down, and the keys a
+        // frame after that, so the click reads them where it lands.
+        match self.holding.take() {
+            Some((Some(button), modifiers)) => {
+                input.events.push(Event::PointerButton {
+                    pos: self.pointer,
+                    button,
+                    pressed: false,
+                    modifiers,
+                });
+                self.holding = Some((None, modifiers));
+            }
+            Some((None, _)) => input.events.push(Event::ModifiersChanged(Modifiers::NONE)),
+            None => {}
+        }
+        while self.next < self.cues.len() && at >= self.cues[self.next].at {
+            match self.cues[self.next].gesture {
+                Gesture::Move(target) => {
+                    let Some(end) = self.target(target, app, ctx) else {
+                        self.failed = true;
+                        log::error!("tour stopped: missing UI target at step {}", self.next);
+                        return;
+                    };
+                    self.motion = Some((at, self.pointer, end));
+                }
+                Gesture::Click(button) => self.click(input, at, button),
+                Gesture::ClickWith(button, modifiers, label) => {
+                    // The click reads the held keys from the input state,
+                    // which keeps them until the next change. Pressed and
+                    // released in one frame, it would not count as a click
+                    // on a message.
+                    input.events.push(Event::ModifiersChanged(modifiers));
+                    input.events.push(Event::PointerButton {
+                        pos: self.pointer,
+                        button,
+                        pressed: true,
+                        modifiers,
+                    });
+                    self.holding = Some((Some(button), modifiers));
+                    self.trace_click(at, button);
+                    self.caption(at, label);
+                }
+                Gesture::Press(key, modifiers) => press(input, key, modifiers),
+                Gesture::Key(key, modifiers, label) => {
+                    press(input, key, modifiers);
+                    self.caption(at, label);
+                }
+                Gesture::Text(character) => input.events.push(Event::Text(character.to_string())),
+                Gesture::Wheel(points) => input.events.push(Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0.0, points),
+                    modifiers: Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                }),
+                Gesture::Remote(act) => act(app),
+                Gesture::Drop(names, label) => {
+                    let dir = media::dir(app);
+                    input.dropped_files.extend(names.iter().map(|name| {
+                        Arc::new(Dropped(dir.join(name)))
+                            as Arc<dyn egui::DroppedFile + Send + Sync>
+                    }));
+                    self.caption(at, label);
+                }
+            }
+            self.next += 1;
+        }
+        self.feeds.show(app, at);
+        if let Some((began, from, to)) = self.motion {
+            let t = ((at - began) / 0.28).clamp(0.0, 1.0);
+            self.pointer = from.lerp(to, t * t * (3.0 - 2.0 * t));
+            if t == 1.0 {
+                self.motion = None;
+            }
+        }
+        for &(from, until, speed) in self.script.scrolls() {
+            let scroll = (at.min(until) - self.previous.max(from)).max(0.0) * speed;
+            if scroll > 0.0
+                && let Some(view) = *app.selection_view.lock().unwrap_or_else(|p| p.into_inner())
+            {
+                self.pointer = view.center();
+                input.events.push(Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0.0, scroll),
+                    modifiers: Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                });
+            }
+        }
+        input.events.insert(0, Event::PointerMoved(self.pointer));
+        if self.trace.last().is_none_or(|event| {
+            !matches!(event.event,
+            TraceEvent::Pointer { x, y } if x == self.pointer.x && y == self.pointer.y)
+        }) {
+            self.trace.push(Trace {
+                at,
+                event: TraceEvent::Pointer {
+                    x: self.pointer.x,
+                    y: self.pointer.y,
+                },
+            });
+        }
+        self.previous = at;
+    }
+
+    fn click(&mut self, input: &mut egui::RawInput, at: f32, button: PointerButton) {
+        for pressed in [true, false] {
+            input.events.push(Event::PointerButton {
+                pos: self.pointer,
+                button,
+                pressed,
+                modifiers: Modifiers::NONE,
+            });
+        }
+        self.trace_click(at, button);
+    }
+
+    fn trace_click(&mut self, at: f32, button: PointerButton) {
+        self.trace.push(Trace {
+            at,
+            event: TraceEvent::Click {
+                x: self.pointer.x,
+                y: self.pointer.y,
+                button: if button == PointerButton::Secondary {
+                    "right"
+                } else {
+                    "left"
+                },
+            },
+        });
+    }
+
+    fn caption(&mut self, at: f32, label: &str) {
+        self.trace.push(Trace {
+            at,
+            event: TraceEvent::Keys {
+                label: crate::ui::keys::label(label),
+            },
+        });
+    }
+
+    pub fn drive(&mut self, _app: &mut App, ctx: &egui::Context) {
+        if let Some(frames) = self.capture.as_mut() {
+            let duration = self.script.duration().as_secs_f32();
+            if frames.end(ctx, self.capture_at, duration, self.failed) {
+                self.save_trace(ctx);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            return;
+        }
+        let now = Instant::now();
+        if let Some(delay) = self.delay.take() {
+            self.start = Some(now + delay);
+        }
+        let Some(start) = self.start else {
+            return;
+        };
+        if now < start {
+            ctx.request_repaint_after(start - now);
+        } else if start.elapsed() < self.script.duration() && !self.failed {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        } else {
+            self.save_trace(ctx);
+        }
+    }
+
+    fn save_trace(&mut self, ctx: &egui::Context) {
+        if std::mem::replace(&mut self.saved, true) {
+            return;
+        }
+        if let Some(path) = &self.trace_path {
+            let data = serde_json::json!({ "width": ctx.content_rect().width(),
+                "height": ctx.content_rect().height(),
+                "duration": self.script.duration().as_secs(),
+                "complete": !self.failed, "events": self.trace });
+            if let Err(error) = std::fs::write(path, data.to_string()) {
+                log::error!("could not write tour input trace: {error}");
+            }
+        }
+    }
+
+    /// Finds click targets in the actual painted UI; no view-specific hooks or
+    /// hard-coded menu coordinates are needed. Called after frame_ui.
+    pub fn observe(&mut self, app: &mut App, ctx: &egui::Context) {
+        session::respond(app);
+        self.labels.clear();
+        let layers: Vec<_> = ctx.memory(|memory| memory.layer_ids().collect());
+        for layer in layers {
+            let transform = ctx.layer_transform_to_global(layer).unwrap_or_default();
+            ctx.graphics(|graphics| {
+                if let Some(list) = graphics.get(layer) {
+                    for clipped in list.all_entries() {
+                        if let egui::Shape::Text(text) = &clipped.shape {
+                            let rect = Rect::from_min_size(text.pos, text.galley.size());
+                            if rect.intersects(clipped.clip_rect) {
+                                let spot = transform * rect.center();
+                                self.labels.insert(text.galley.text().to_owned(), spot);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// A file the tour drops on the window, from its own media folder.
+#[derive(Debug)]
+struct Dropped(PathBuf);
+
+impl egui::DroppedFile for Dropped {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        std::fs::read(&self.0).map_err(|error| error.to_string())
+    }
+}
+
+/// Presses and releases `key`.
+fn press(input: &mut egui::RawInput, key: Key, modifiers: Modifiers) {
+    for pressed in [true, false] {
+        input.events.push(Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Dialog, Page, PickerTab};
+
+    fn frame(app: &mut App, tour: &mut Tour, ctx: &egui::Context, events: Vec<Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1180.0, 780.0))),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            app.background_frame(ctx);
+            app.frame_ui(ui);
+            tour.observe(app, ctx);
+        });
+        output.textures_delta.clear();
+    }
+    fn click(app: &mut App, tour: &mut Tour, ctx: &egui::Context, label: &str) {
+        let pos = *tour
+            .labels
+            .get(label)
+            .unwrap_or_else(|| panic!("missing {label}"));
+        for pressed in [true, false] {
+            frame(
+                app,
+                tour,
+                ctx,
+                vec![
+                    Event::PointerMoved(pos),
+                    Event::PointerButton {
+                        pos,
+                        button: PointerButton::Primary,
+                        pressed,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        frame(app, tour, ctx, Vec::new());
+    }
+
+    /// The starred panel lists the message itself, and the open chat knows
+    /// which messages are starred, which is what its footer paints from.
+    #[test]
+    fn the_starred_list_shows_the_message_and_the_mark() {
+        let mut app = super::super::tests::app();
+        prepare(&mut app);
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let mut tour = Tour::new(None, None);
+        frame(&mut app, &mut tour, &ctx, Vec::new());
+        let chat = app.open_chat.clone().expect("a chat is open");
+        let source = app.conversations[&chat]
+            .messages
+            .first()
+            .expect("the chat has messages")
+            .clone();
+        let body = source.content.full_summary();
+        // The star reaches the open chat: this is what the footer paints from.
+        app.stars
+            .insert(chat.clone(), [source.id.clone()].into_iter().collect());
+        app.show_starred = true;
+        app.starred = vec![crate::archive::Starred {
+            message: source.clone(),
+            starred_at: crate::util::now(),
+        }];
+        frame(&mut app, &mut tour, &ctx, Vec::new());
+        // The header's title shows only where it fits beside its buttons, as
+        // every list title does, so the row is what names where the star is.
+        assert!(
+            tour.labels.contains_key(&app.chat_title_of(&chat)),
+            "the row names the chat by its title"
+        );
+        assert!(
+            tour.labels.contains_key(&body),
+            "the row shows the starred message itself"
+        );
+        assert!(
+            app.stars[&chat].contains(&source.id),
+            "the open chat knows which messages are starred"
+        );
+    }
+
+    #[test]
+    fn the_chat_search_pane_lists_hits_and_opens_one() {
+        let mut app = super::super::tests::app();
+        prepare(&mut app);
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let mut tour = Tour::new(None, None);
+        let open = super::super::sample_ids()[0].to_owned();
+        let other = super::super::sample_ids()[1].to_owned();
+        app.actions.push(crate::model::Action::OpenChat(open));
+        frame(&mut app, &mut tour, &ctx, Vec::new());
+        app.actions.push(crate::model::Action::OpenChatSearch);
+        frame(&mut app, &mut tour, &ctx, Vec::new());
+        app.chat_search = "engine".into();
+        // Hits from another chat, so their text is painted only in the pane
+        // and the click lands on the row rather than on a bubble.
+        app.chat_search_hits = app
+            .conversations
+            .get(&other)
+            .map(|conversation| conversation.messages.clone())
+            .unwrap_or_default();
+        for _ in 0..3 {
+            frame(&mut app, &mut tour, &ctx, Vec::new());
+        }
+        // The pane's copy is translated, and the interface language follows
+        // the system when Settings carries no choice of its own.
+        let title = crate::i18n::gettext(app.locale, "Search messages").to_string();
+        assert!(tour.labels.contains_key(&title), "the pane names itself");
+        let hit = app.chat_search_hits.first().cloned().expect("a hit");
+        // The row previews the line the query matched, not the message's first
+        // line, so that is the text the click lands on.
+        let preview = hit.text_matching("engine").unwrap_or_else(|| hit.summary());
+        click(&mut app, &mut tour, &ctx, &preview);
+        assert_eq!(
+            app.open_chat.as_deref(),
+            Some(hit.chat.as_str()),
+            "clicking a hit opens the chat it belongs to"
+        );
+        // The jump is consumed by the frame that scrolls to it, so the flash
+        // it leaves behind is what says the message was the one asked for.
+        assert_eq!(
+            app.jump_highlight
+                .as_ref()
+                .map(|jump| (jump.chat.as_str(), jump.message.as_str())),
+            Some((hit.chat.as_str(), hit.id.as_str())),
+            "and brings that message into view"
+        );
+    }
+
+    #[test]
+    fn the_keyboard_walks_the_chat_search_results_and_escape_closes_the_pane() {
+        let mut app = super::super::tests::app();
+        prepare(&mut app);
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let mut tour = Tour::new(None, None);
+        let open = super::super::sample_ids()[0].to_owned();
+        app.actions
+            .push(crate::model::Action::OpenChat(open.clone()));
+        frame(&mut app, &mut tour, &ctx, Vec::new());
+        app.actions.push(crate::model::Action::OpenChatSearch);
+        frame(&mut app, &mut tour, &ctx, Vec::new());
+        app.chat_search = "e".into();
+        // Newest first, as the archive answers.
+        app.chat_search_hits = app.conversations[&open]
+            .messages
+            .iter()
+            .rev()
+            .take(3)
+            .cloned()
+            .collect();
+        assert_eq!(app.chat_search_hits.len(), 3);
+        frame(&mut app, &mut tour, &ctx, Vec::new());
+        let field = egui::Id::new("chat-message-search");
+        assert!(ctx.memory(|memory| memory.has_focus(field)));
+        let key = |key: egui::Key| Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        frame(&mut app, &mut tour, &ctx, vec![key(egui::Key::ArrowDown)]);
+        frame(&mut app, &mut tour, &ctx, vec![key(egui::Key::ArrowDown)]);
+        frame(&mut app, &mut tour, &ctx, vec![key(egui::Key::ArrowDown)]);
+        frame(&mut app, &mut tour, &ctx, vec![key(egui::Key::ArrowDown)]);
+        assert_eq!(app.chat_search_selected, Some(2), "stops at the last");
+        frame(&mut app, &mut tour, &ctx, vec![key(egui::Key::ArrowUp)]);
+        frame(&mut app, &mut tour, &ctx, vec![key(egui::Key::Enter)]);
+        frame(&mut app, &mut tour, &ctx, Vec::new());
+        let second = app.chat_search_hits[1].id.clone();
+        assert_eq!(
+            app.jump_highlight
+                .as_ref()
+                .map(|jump| jump.message.as_str()),
+            Some(second.as_str()),
+            "Enter jumps to the result reached"
+        );
+        assert!(
+            ctx.memory(|memory| memory.has_focus(field)),
+            "and the field keeps the keyboard for the next one"
+        );
+        assert!(app.chat_search_open);
+        frame(&mut app, &mut tour, &ctx, vec![key(egui::Key::Escape)]);
+        frame(&mut app, &mut tour, &ctx, Vec::new());
+        assert!(!app.chat_search_open, "Escape closes the pane");
+        assert_eq!(
+            app.open_chat.as_deref(),
+            Some(open.as_str()),
+            "not the chat"
+        );
+        assert!(app.chat_search.is_empty());
+    }
+
+    #[test]
+    fn a_narrow_window_lays_the_search_pane_over_the_chat_and_folds_it_on_a_pick() {
+        let mut app = super::super::tests::app();
+        prepare(&mut app);
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let mut tour = Tour::new(None, None);
+        let narrow = |app: &mut App, tour: &mut Tour, events: Vec<Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(760.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                app.background_frame(&ctx);
+                app.frame_ui(ui);
+                tour.observe(app, &ctx);
+            });
+            output.textures_delta.clear();
+        };
+        let open = super::super::sample_ids()[0].to_owned();
+        app.actions
+            .push(crate::model::Action::OpenChat(open.clone()));
+        narrow(&mut app, &mut tour, Vec::new());
+        app.actions.push(crate::model::Action::OpenChatSearch);
+        narrow(&mut app, &mut tour, Vec::new());
+        app.chat_search = "e".into();
+        app.chat_search_hits = app.conversations[&open]
+            .messages
+            .iter()
+            .rev()
+            .take(2)
+            .cloned()
+            .collect();
+        narrow(&mut app, &mut tour, Vec::new());
+        // The chat list leaves too little room to share, so the pane lies
+        // over the conversation rather than squeezing it.
+        let overlay = ctx.memory(|memory| {
+            memory
+                .layer_ids()
+                .any(|layer| layer.id == egui::Id::new("chat-search-overlay"))
+        });
+        assert!(overlay, "the pane is laid over the chat");
+        let enter = Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        narrow(&mut app, &mut tour, vec![enter]);
+        narrow(&mut app, &mut tour, Vec::new());
+        let newest = app.chat_search_hits[0].id.clone();
+        assert_eq!(
+            app.jump_highlight
+                .as_ref()
+                .map(|jump| jump.message.as_str()),
+            Some(newest.as_str())
+        );
+        assert!(!app.chat_search_open, "folded so the message shows");
+        assert_eq!(app.chat_search, "e", "with the search kept for later");
+        app.actions.push(crate::model::Action::OpenChatSearch);
+        narrow(&mut app, &mut tour, Vec::new());
+        assert!(app.chat_search_open);
+        assert_eq!(app.chat_search_hits.len(), 2, "as it was");
+    }
+
+    /// A frame at `size` that also reports the address the frame asked the
+    /// browser to open, if any.
+    fn frame_sized(
+        app: &mut App,
+        tour: &mut Tour,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        events: Vec<Event>,
+    ) -> Option<String> {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            app.background_frame(ctx);
+            app.frame_ui(ui);
+            tour.observe(app, ctx);
+        });
+        output.textures_delta.clear();
+        output
+            .platform_output
+            .commands
+            .into_iter()
+            .find_map(|command| match command {
+                egui::OutputCommand::OpenUrl(open) => Some(open.url),
+                _ => None,
+            })
+    }
+
+    /// Presses and releases the pointer on the painted `label`, and reports
+    /// the address the frames asked the browser to open, if any.
+    fn click_sized(
+        app: &mut App,
+        tour: &mut Tour,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        label: &str,
+    ) -> Option<String> {
+        let pos = *tour
+            .labels
+            .get(label)
+            .unwrap_or_else(|| panic!("missing {label}"));
+        let mut opened = None;
+        for pressed in [true, false] {
+            opened = opened.or(frame_sized(
+                app,
+                tour,
+                ctx,
+                size,
+                vec![
+                    Event::PointerMoved(pos),
+                    Event::PointerButton {
+                        pos,
+                        button: PointerButton::Primary,
+                        pressed,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+            ));
+        }
+        opened.or(frame_sized(app, tour, ctx, size, Vec::new()))
+    }
+
+    /// Every way in opens the panel beside the chat, never a modal: the chat
+    /// header, the header menu's Info, a sender's name in a group, and the
+    /// chat list's Info, which also opens that chat.
+    #[test]
+    fn every_entry_opens_the_info_panel_beside_the_chat() {
+        let mut app = super::super::tests::app();
+        prepare(&mut app);
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let mut tour = Tour::new(None, None);
+        let ada = super::super::sample_ids()[0].to_owned();
+        let group = super::super::sample_ids()[1].to_owned();
+        let shown = |app: &App| app.info.as_ref().map(|info| info.chat.clone());
+        app.actions
+            .push(crate::model::Action::OpenChat(ada.clone()));
+        for _ in 0..3 {
+            frame(&mut app, &mut tour, &ctx, Vec::new());
+        }
+        // The header's name is painted after the chat list's, so the click
+        // lands on the header.
+        click(&mut app, &mut tour, &ctx, "Ada Lovelace");
+        assert_eq!(shown(&app), Some(ada.clone()), "the header opens it");
+        assert!(app.dialog.is_none(), "as a panel, not a modal");
+        app.actions.push(crate::model::Action::CloseInfo);
+        frame(&mut app, &mut tour, &ctx, Vec::new());
+        app.open_header_menu = Some(ada.clone());
+        for _ in 0..3 {
+            frame(&mut app, &mut tour, &ctx, Vec::new());
+        }
+        click(&mut app, &mut tour, &ctx, "Info");
+        assert_eq!(shown(&app), Some(ada.clone()), "the header menu opens it");
+        app.open_header_menu = None;
+        app.actions
+            .push(crate::model::Action::OpenChat(group.clone()));
+        for _ in 0..3 {
+            frame(&mut app, &mut tour, &ctx, Vec::new());
+        }
+        assert_eq!(shown(&app), None, "another chat closes it");
+        // Mira's name over her message in the group opens her own panel,
+        // over the group that stays open.
+        let mira = "491702222222@s.whatsapp.net";
+        click(&mut app, &mut tour, &ctx, "Mira");
+        assert_eq!(shown(&app), Some(mira.to_owned()), "a sender opens theirs");
+        assert_eq!(app.open_chat.as_deref(), Some(group.as_str()));
+        // The chat list's Info opens that chat and its panel together.
+        app.open_chat_menu = Some(ada.clone());
+        for _ in 0..3 {
+            frame(&mut app, &mut tour, &ctx, Vec::new());
+        }
+        click(&mut app, &mut tour, &ctx, "Info");
+        assert_eq!(app.open_chat.as_deref(), Some(ada.as_str()));
+        assert_eq!(shown(&app), Some(ada), "the chat list's Info opens both");
+    }
+
+    /// The panel shares the search pane's docking: beside the chat when the
+    /// window has room, over it when the chat list leaves too little.
+    #[test]
+    fn the_info_panel_takes_a_column_and_is_a_page_in_a_narrow_window() {
+        let mut app = super::super::tests::app();
+        prepare(&mut app);
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let mut tour = Tour::new(None, None);
+        let ada = super::super::sample_ids()[0].to_owned();
+        app.actions
+            .push(crate::model::Action::OpenChat(ada.clone()));
+        frame(&mut app, &mut tour, &ctx, Vec::new());
+        app.actions.push(crate::model::Action::OpenInfo(ada));
+        let docked = |ctx: &egui::Context| {
+            ctx.data(|data| data.get_temp::<bool>(crate::ui::info::docked_id()))
+        };
+        for _ in 0..2 {
+            frame_sized(&mut app, &mut tour, &ctx, vec2(1180.0, 780.0), Vec::new());
+        }
+        assert_eq!(docked(&ctx), Some(true), "docked in a wide window");
+        // Too tight for the list, the conversation and the panel: the list
+        // steps aside and the panel keeps its own column.
+        for _ in 0..2 {
+            frame_sized(&mut app, &mut tour, &ctx, vec2(760.0, 600.0), Vec::new());
+        }
+        assert_eq!(docked(&ctx), Some(true), "still a column of its own");
+        // The narrow window mode shows it as a page over the chat.
+        for _ in 0..2 {
+            frame_sized(&mut app, &mut tour, &ctx, vec2(560.0, 600.0), Vec::new());
+        }
+        assert_eq!(docked(&ctx), Some(false), "a page in a narrow window");
+        assert!(app.info.is_some());
+        app.actions.push(crate::model::Action::CloseInfo);
+        frame_sized(&mut app, &mut tour, &ctx, vec2(560.0, 600.0), Vec::new());
+        assert_eq!(docked(&ctx), None, "gone with the panel");
+    }
+
+    /// The overview's media row opens the media view, whose tabs list the
+    /// chat's pictures, documents and links; a document goes to its message
+    /// and a link opens in the browser.
+    #[test]
+    fn the_media_row_opens_the_media_view_with_its_tabs_and_items() {
+        use crate::model::{InfoView, MediaTab};
+        let mut app = super::super::tests::app();
+        prepare(&mut app);
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let mut tour = Tour::new(None, None);
+        let size = vec2(1280.0, 800.0);
+        let ada = super::super::sample_ids()[0].to_owned();
+        app.actions
+            .push(crate::model::Action::OpenChat(ada.clone()));
+        frame_sized(&mut app, &mut tour, &ctx, size, Vec::new());
+        super::super::apply_flags(&mut app, Some("info"));
+        for _ in 0..3 {
+            frame_sized(&mut app, &mut tour, &ctx, size, Vec::new());
+        }
+        let view = |app: &App| app.info.as_ref().map(|info| info.view);
+        // The panel's copy is translated, and the interface language
+        // follows the system when Settings carries no choice of its own.
+        let locale = app.locale;
+        let media_title = crate::i18n::gettext(locale, "Media, links and docs").to_string();
+        click_sized(&mut app, &mut tour, &ctx, size, &media_title);
+        assert_eq!(view(&app), Some(InfoView::Media(MediaTab::Media)));
+        let docs = crate::ui::info::tab_label(&app, MediaTab::Docs);
+        click_sized(&mut app, &mut tour, &ctx, size, &docs);
+        assert_eq!(view(&app), Some(InfoView::Media(MediaTab::Docs)));
+        // The bubble under the panel paints the same file name and title, so
+        // the clicks land on the rows' detail lines, which carry the day.
+        let doc = app.conversations[&ada]
+            .message("ada-doc")
+            .cloned()
+            .expect("the sample document");
+        let crate::model::Content::Document { media, pages, .. } = &doc.content else {
+            panic!("a document");
+        };
+        let pages = pages.expect("pages");
+        let detail = format!(
+            "{} · {} · {}",
+            crate::i18n::ngettext(locale, "{} page", "{} pages", pages)
+                .replace("{}", &pages.to_string()),
+            crate::util::bytes(media.size),
+            crate::util::chat_stamp(locale, doc.timestamp)
+        );
+        click_sized(&mut app, &mut tour, &ctx, size, &detail);
+        assert_eq!(
+            app.jump_highlight
+                .as_ref()
+                .map(|jump| jump.message.as_str()),
+            Some("ada-doc"),
+            "a document goes to its message"
+        );
+        assert!(app.info.is_some(), "and the panel stays");
+        let links = crate::ui::info::tab_label(&app, MediaTab::Links);
+        click_sized(&mut app, &mut tour, &ctx, size, &links);
+        assert_eq!(view(&app), Some(InfoView::Media(MediaTab::Links)));
+        // The newest link the listing found, whichever the tour's sample
+        // put there.
+        let link = app
+            .info_media
+            .as_ref()
+            .and_then(|media| media.links.first())
+            .cloned()
+            .expect("a link in the sample");
+        let detail = format!(
+            "{} · {}",
+            crate::ui::info::domain(&link.url),
+            crate::util::chat_stamp(app.locale, link.timestamp)
+        );
+        let opened = click_sized(&mut app, &mut tour, &ctx, size, &detail);
+        // The safety check hands the browser a normalised address.
+        assert_eq!(
+            opened.as_deref().map(|url| url.trim_end_matches('/')),
+            Some(link.url.trim_end_matches('/')),
+            "a link opens in the browser"
+        );
+        // Escape walks back: the overview first, then the panel closes.
+        let escape = Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        frame_sized(&mut app, &mut tour, &ctx, size, vec![escape.clone()]);
+        assert_eq!(view(&app), Some(InfoView::Overview));
+        frame_sized(&mut app, &mut tour, &ctx, size, vec![escape]);
+        assert!(app.info.is_none());
+    }
+
+    /// The Tab key stays inside the panel's name fields while one is being
+    /// typed in: the main cycle would otherwise jump to the composer.
+    #[test]
+    fn tab_moves_from_the_first_name_to_the_surname() {
+        let mut app = super::super::tests::app();
+        prepare(&mut app);
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let mut tour = Tour::new(None, None);
+        let size = vec2(1280.0, 800.0);
+        let ada = super::super::sample_ids()[0].to_owned();
+        app.actions
+            .push(crate::model::Action::OpenChat(ada.clone()));
+        frame_sized(&mut app, &mut tour, &ctx, size, Vec::new());
+        super::super::apply_flags(&mut app, Some("info"));
+        app.actions.push(crate::model::Action::EditContact {
+            id: ada,
+            name: "Ada Lovelace".into(),
+        });
+        for _ in 0..3 {
+            frame_sized(&mut app, &mut tour, &ctx, size, Vec::new());
+        }
+        let first = egui::Id::new("contact-first");
+        let last = egui::Id::new("contact-last");
+        ctx.memory_mut(|memory| memory.request_focus(first));
+        frame_sized(&mut app, &mut tour, &ctx, size, Vec::new());
+        assert!(ctx.memory(|memory| memory.has_focus(first)));
+        let tab = Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        frame_sized(&mut app, &mut tour, &ctx, size, vec![tab]);
+        frame_sized(&mut app, &mut tour, &ctx, size, Vec::new());
+        assert!(
+            ctx.memory(|memory| memory.has_focus(last)),
+            "Tab reaches the surname, focus is on {:?}",
+            ctx.memory(|memory| memory.focused())
+        );
+        assert!(app.contact_edit.is_some(), "the edit is still open");
+    }
+
+    /// Enter on the "Media, links and docs" row opens the media view with
+    /// the keyboard on Back, and Back puts it back on the row.
+    #[test]
+    fn enter_on_the_media_row_keeps_the_keyboard_in_the_panel() {
+        use crate::model::{InfoView, MediaTab};
+        use crate::ui::focus::{Stop, control};
+        let mut app = super::super::tests::app();
+        prepare(&mut app);
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let mut tour = Tour::new(None, None);
+        let size = vec2(1280.0, 800.0);
+        let ada = super::super::sample_ids()[0].to_owned();
+        app.actions.push(crate::model::Action::OpenChat(ada));
+        frame_sized(&mut app, &mut tour, &ctx, size, Vec::new());
+        super::super::apply_flags(&mut app, Some("info"));
+        for _ in 0..3 {
+            frame_sized(&mut app, &mut tour, &ctx, size, Vec::new());
+        }
+        let row = control(&ctx, Stop::InfoControl(crate::ui::info::MEDIA_ROW_STOP))
+            .expect("the media row is a stop");
+        ctx.memory_mut(|memory| memory.request_focus(row));
+        let enter = || Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        frame_sized(&mut app, &mut tour, &ctx, size, vec![enter()]);
+        for _ in 0..2 {
+            frame_sized(&mut app, &mut tour, &ctx, size, Vec::new());
+        }
+        assert_eq!(
+            app.info.as_ref().map(|info| info.view),
+            Some(InfoView::Media(MediaTab::Media))
+        );
+        let back = control(&ctx, Stop::InfoClose).expect("the Back button");
+        assert!(
+            ctx.memory(|memory| memory.has_focus(back)),
+            "Back has the keyboard, not {:?}",
+            ctx.memory(|memory| memory.focused())
+        );
+        frame_sized(&mut app, &mut tour, &ctx, size, vec![enter()]);
+        for _ in 0..2 {
+            frame_sized(&mut app, &mut tour, &ctx, size, Vec::new());
+        }
+        assert_eq!(
+            app.info.as_ref().map(|info| info.view),
+            Some(InfoView::Overview)
+        );
+        let row = control(&ctx, Stop::InfoControl(crate::ui::info::MEDIA_ROW_STOP))
+            .expect("the media row again");
+        assert!(ctx.memory(|memory| memory.has_focus(row)));
+    }
+
+    /// Over a narrow chat the panel would hide the message an item goes
+    /// to, so it closes, as the search pane folds.
+    #[test]
+    fn an_item_opened_from_the_overlay_closes_the_panel() {
+        use crate::model::{InfoView, MediaTab};
+        let mut app = super::super::tests::app();
+        prepare(&mut app);
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let mut tour = Tour::new(None, None);
+        let size = vec2(560.0, 600.0);
+        let ada = super::super::sample_ids()[0].to_owned();
+        app.actions
+            .push(crate::model::Action::OpenChat(ada.clone()));
+        frame_sized(&mut app, &mut tour, &ctx, size, Vec::new());
+        super::super::apply_flags(&mut app, Some("info-docs"));
+        for _ in 0..3 {
+            frame_sized(&mut app, &mut tour, &ctx, size, Vec::new());
+        }
+        assert_eq!(
+            app.info.as_ref().map(|info| info.view),
+            Some(InfoView::Media(MediaTab::Docs))
+        );
+        let locale = app.locale;
+        let doc = app.conversations[&ada]
+            .message("ada-doc")
+            .cloned()
+            .expect("the sample document");
+        let crate::model::Content::Document { media, pages, .. } = &doc.content else {
+            panic!("a document");
+        };
+        let pages = pages.expect("pages");
+        let detail = format!(
+            "{} · {} · {}",
+            crate::i18n::ngettext(locale, "{} page", "{} pages", pages)
+                .replace("{}", &pages.to_string()),
+            crate::util::bytes(media.size),
+            crate::util::chat_stamp(locale, doc.timestamp)
+        );
+        click_sized(&mut app, &mut tour, &ctx, size, &detail);
+        assert_eq!(
+            app.jump_highlight
+                .as_ref()
+                .map(|jump| jump.message.as_str()),
+            Some("ada-doc")
+        );
+        assert!(
+            app.info.is_none(),
+            "the panel folds away over a narrow chat"
+        );
+    }
+
+    /// A member whose private chat is locked shows who they are, and no
+    /// media section: what was shared with them stays in the locked folder.
+    #[test]
+    fn a_locked_members_panel_has_no_media_section() {
+        use crate::backend::Command;
+        let mut app = super::super::tests::app();
+        prepare(&mut app);
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        app.backend.record_demo_commands();
+        let mut tour = Tour::new(None, None);
+        let group = super::super::sample_ids()[1].to_owned();
+        let mira = "491702222222@s.whatsapp.net";
+        let mut private = crate::model::Chat::new(mira.into(), "Mira".into());
+        private.locked = true;
+        app.chats.push(private);
+        app.actions.push(crate::model::Action::OpenChat(group));
+        for _ in 0..3 {
+            frame(&mut app, &mut tour, &ctx, Vec::new());
+        }
+        app.backend.take_demo_commands();
+        click(&mut app, &mut tour, &ctx, "Mira");
+        for _ in 0..2 {
+            frame(&mut app, &mut tour, &ctx, Vec::new());
+        }
+        assert_eq!(app.info.as_ref().map(|info| info.chat.as_str()), Some(mira));
+        let title = crate::i18n::gettext(app.locale, "Media, links and docs").to_string();
+        assert!(
+            !tour.labels.contains_key(&title),
+            "no media section for a locked chat"
+        );
+        assert!(
+            !app.backend
+                .take_demo_commands()
+                .iter()
+                .any(|command| matches!(command, Command::ListChatShared { .. })),
+            "and nothing is asked for it"
+        );
+    }
+
+    #[test]
+    fn leaving_is_offered_for_a_group_and_for_a_channel() {
+        for (index, leave, title, archive) in [
+            (
+                1usize,
+                "Leave group",
+                "Leave this group?",
+                "Leave group and archive",
+            ),
+            (
+                9usize,
+                "Leave channel",
+                "Leave this channel?",
+                "Leave channel and archive",
+            ),
+        ] {
+            let mut app = super::super::tests::app();
+            prepare(&mut app);
+            let ctx = egui::Context::default();
+            app.attach(&ctx);
+            let mut tour = Tour::new(None, None);
+            let id = super::super::sample_ids()[index].to_owned();
+            app.open_chat = Some(id.clone());
+            app.info = Some(crate::model::InfoPanel {
+                chat: id.clone(),
+                view: crate::model::InfoView::Overview,
+            });
+            for _ in 0..3 {
+                frame(&mut app, &mut tour, &ctx, Vec::new());
+            }
+            // Leave closes the panel's list: scroll to its end, past a
+            // group's members, link and Add members, as a reader would.
+            let over_panel = Pos2::new(1100.0, 400.0);
+            for _ in 0..4 {
+                frame(
+                    &mut app,
+                    &mut tour,
+                    &ctx,
+                    vec![
+                        Event::PointerMoved(over_panel),
+                        Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: vec2(0.0, -2000.0),
+                            modifiers: Modifiers::NONE,
+                            phase: egui::TouchPhase::Move,
+                        },
+                    ],
+                );
+            }
+            for _ in 0..3 {
+                frame(&mut app, &mut tour, &ctx, Vec::new());
+            }
+            // The controls are announced in the interface language, which
+            // follows the system when Settings carries no choice of its own.
+            let locale = app.locale;
+            let leave = crate::i18n::gettext(locale, leave).to_string();
+            let title = crate::i18n::gettext(locale, title).to_string();
+            let archive = crate::i18n::gettext(locale, archive).to_string();
+            assert!(tour.labels.contains_key(&leave), "chat info offers {leave}");
+            click(&mut app, &mut tour, &ctx, &leave);
+            assert!(
+                matches!(
+                    app.dialog,
+                    Some(crate::model::Dialog::ConfirmLeaveGroup(ref open)) if *open == id
+                ),
+                "the button opens the confirm dialog for {id}"
+            );
+            for _ in 0..3 {
+                frame(&mut app, &mut tour, &ctx, Vec::new());
+            }
+            assert!(tour.labels.contains_key(&title), "the dialog asks {title}");
+            assert!(
+                tour.labels.contains_key(&leave),
+                "the dialog offers {leave}"
+            );
+            assert!(
+                tour.labels.contains_key(&archive),
+                "the dialog offers archiving in the same step"
+            );
+            // Cancelling leaves the chat alone.
+            let cancel = crate::i18n::gettext(locale, "Cancel").to_string();
+            click(&mut app, &mut tour, &ctx, &cancel);
+            assert!(app.dialog.is_none(), "cancel closes the dialog");
+            let chat = app.chat(&id).expect("chat");
+            assert!(!chat.read_only, "cancelling does not leave the chat");
+            assert!(chat.can_leave(&app.our_ids()), "and it stays leaveable");
+        }
+    }
+
+    #[test]
+    fn polls_are_created_and_voted_through_real_controls() {
+        let mut app = super::super::tests::app();
+        app.backend.record_demo_commands();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let mut tour = Tour::new(None, None);
+        let chat = app.open_chat.clone().unwrap();
+        for multiple in [false, true] {
+            app.actions
+                .push(crate::model::Action::ShowDialog(Dialog::CreatePoll(
+                    chat.clone(),
+                )));
+            frame(&mut app, &mut tour, &ctx, Vec::new());
+            app.poll_draft = crate::model::PollDraft {
+                question: "Lunch?".into(),
+                options: vec!["Pizza".into(), "Pasta".into()],
+                multiple,
+            };
+            for _ in 0..3 {
+                frame(&mut app, &mut tour, &ctx, Vec::new());
+            }
+            click(&mut app, &mut tour, &ctx, "Send poll");
+            assert!(app.dialog.is_none());
+            assert!(!app.poll_creating);
+            for _ in 0..3 {
+                frame(&mut app, &mut tour, &ctx, Vec::new());
+            }
+            click(&mut app, &mut tour, &ctx, "Pizza");
+            click(&mut app, &mut tour, &ctx, "Pasta");
+            let Content::Poll { state, .. } =
+                &app.conversations[&chat].messages.last().unwrap().content
+            else {
+                panic!("poll")
+            };
+            assert_eq!(state.selected, if multiple { vec![0, 1] } else { vec![1] });
+            assert_eq!(state.voters, 1);
+            click(&mut app, &mut tour, &ctx, "Pasta");
+            if multiple {
+                click(&mut app, &mut tour, &ctx, "Pizza");
+            }
+            let Content::Poll { state, .. } =
+                &app.conversations[&chat].messages.last().unwrap().content
+            else {
+                panic!("poll")
+            };
+            assert!(state.selected.is_empty());
+            assert_eq!(state.counts, vec![0, 0]);
+            assert_eq!(state.voters, 0);
+            assert!(app.poll_voting.is_empty());
+        }
+    }
+
+    #[test]
+    fn the_settings_search_finds_account_privacy_rows() {
+        let mut app = super::super::tests::app();
+        app.page = Page::Settings;
+        app.settings_search = "profile photo".into();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let mut tour = Tour::new(None, None);
+        for _ in 0..3 {
+            frame(&mut app, &mut tour, &ctx, Vec::new());
+        }
+        assert!(tour.labels.contains_key("Profile photo"));
+        assert!(!tour.labels.contains_key("Last seen"));
+        assert!(!tour.labels.contains_key("Enter sends"));
+        // The section title keeps every row in it.
+        app.settings_search = "privacy".into();
+        for _ in 0..3 {
+            frame(&mut app, &mut tour, &ctx, Vec::new());
+        }
+        assert!(tour.labels.contains_key("Last seen"));
+        assert!(tour.labels.contains_key("Send read receipts"));
+    }
+
+    #[test]
+    fn receipts_and_typing_sit_in_settings_privacy() {
+        let mut app = super::super::tests::app();
+        app.page = Page::Settings;
+        // The section headings are translated, so pin the interface language
+        // rather than reading whatever this machine is set to.
+        app.settings.interface_language = Some(crate::i18n::Locale::English);
+        app.locale = crate::i18n::Locale::English;
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let mut tour = Tour::new(None, None);
+        for _ in 0..3 {
+            frame(&mut app, &mut tour, &ctx, Vec::new());
+        }
+        // Privacy sits below the fold. How far below depends on the platform's
+        // own rows, so scroll until the section is on screen instead of by a
+        // fixed distance: a few points too far and the heading leaves the top
+        // of the view again, and `labels` only holds what a frame painted.
+        let wheel = |delta: f32| {
+            vec![
+                Event::PointerMoved(pos2(590.0, 400.0)),
+                Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0.0, delta),
+                    modifiers: Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                },
+            ]
+        };
+        // The heading and the first category it writes, with both switches
+        // between them, have to share one frame for the order to mean
+        // anything.
+        let on_screen = |tour: &Tour| {
+            [
+                "Privacy",
+                "Send read receipts",
+                "Show when you are typing",
+                "Last seen",
+            ]
+            .iter()
+            .all(|label| tour.labels.contains_key(*label))
+        };
+        let mut frames = 0;
+        while !on_screen(&tour) && frames < 40 {
+            frame(&mut app, &mut tour, &ctx, wheel(-160.0));
+            frames += 1;
+        }
+        assert!(
+            on_screen(&tour),
+            "the Privacy section and its switches are on screen"
+        );
+        let privacy = *tour.labels.get("Privacy").expect("Privacy section");
+        let last_seen = *tour.labels.get("Last seen").expect("account last seen");
+        let receipts = *tour
+            .labels
+            .get("Send read receipts")
+            .expect("read receipts");
+        let typing = *tour.labels.get("Show when you are typing").expect("typing");
+        // Both switches belong to the account, so they sit inside the Privacy
+        // section, between its heading and the first category it writes.
+        assert!(
+            privacy.y < receipts.y && receipts.y < last_seen.y,
+            "receipts at {receipts:?} should sit between Privacy {privacy:?} and Last seen {last_seen:?}"
+        );
+        assert!(
+            privacy.y < typing.y && typing.y < last_seen.y,
+            "typing at {typing:?} should sit between Privacy {privacy:?} and Last seen {last_seen:?}"
+        );
+    }
+
+    #[test]
+    fn the_theme_dropdown_selects_spotifast_palettes_and_returns_to_follow_system() {
+        let mut app = super::super::tests::app();
+        // Keep Follow system unique to the open menu while scrolling its choices.
+        app.settings.theme = ThemeChoice::Dark;
+        app.page = Page::Settings;
+        app.custom_themes =
+            crate::theme::Catalog::preview(crate::theme::presets().collect(), false);
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let mut tour = Tour::new(None, None);
+        for _ in 0..3 {
+            frame(&mut app, &mut tour, &ctx, Vec::new());
+        }
+        click(&mut app, &mut tour, &ctx, "Dark");
+        let menu_pos = tour.labels["Nord"];
+        for name in [
+            "Follow system",
+            "Light",
+            "Dark",
+            "Catppuccin Latte",
+            "Catppuccin",
+            "Nord",
+            "Ristretto",
+            "Tokyo Night",
+            "Rose Pine",
+            "Rose Pine Moon",
+            "Rose Pine Dawn",
+        ] {
+            // The bundled choices now exceed the popup's visible height.
+            // Scroll over the menu, as a user would, to reveal later entries.
+            for _ in 0..20 {
+                if tour.labels.contains_key(name) {
+                    break;
+                }
+                frame(
+                    &mut app,
+                    &mut tour,
+                    &ctx,
+                    vec![
+                        Event::PointerMoved(menu_pos),
+                        Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: vec2(0.0, -30.0),
+                            modifiers: Modifiers::NONE,
+                            phase: egui::TouchPhase::Move,
+                        },
+                    ],
+                );
+            }
+            assert!(
+                tour.labels.contains_key(name),
+                "missing theme choice {name}"
+            );
+        }
+        for _ in 0..20 {
+            if tour.labels.contains_key("Follow system") {
+                break;
+            }
+            frame(
+                &mut app,
+                &mut tour,
+                &ctx,
+                vec![
+                    Event::PointerMoved(menu_pos),
+                    Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: vec2(0.0, 30.0),
+                        modifiers: Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                    },
+                ],
+            );
+        }
+        click(&mut app, &mut tour, &ctx, "Nord");
+        assert_eq!(app.settings.custom_theme.as_deref(), Some("Nord.json"));
+        assert_eq!(
+            app.palette.window,
+            egui::Color32::from_rgb(0x2e, 0x34, 0x40)
+        );
+        click(&mut app, &mut tour, &ctx, "Nord");
+        click(&mut app, &mut tour, &ctx, "Follow system");
+        assert!(app.settings.custom_theme.is_none());
+        assert_eq!(app.settings.theme, ThemeChoice::System);
+    }
+
+    #[test]
+    fn the_whats_new_tour_reaches_every_feature_through_real_input() {
+        let mut app = super::super::tests::app();
+        Script::WhatsNew.prepare(&mut app);
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let mut tour = Tour::scripted(Script::WhatsNew, None, None, None);
+        let features = [
+            "plus menu",
+            "poll dialog",
+            "chat search results",
+            "day calendar",
+            "day filter",
+            "jump to a result",
+            "photo preview",
+            "zoomed photo",
+            "video in its bubble",
+            "round video message",
+            "favorite stickers",
+            "sticker pack",
+            "sticker search by emoji",
+            "sticker search by pack",
+            "message info with receipts",
+            "favorites chip",
+            "label chip",
+            "chat menu with labels",
+            "voice recorder",
+            "sent voice message",
+            "playback speed",
+            "avatar rail",
+            "hover reply control",
+            "multi-select",
+            "forward dialog",
+            "language list",
+            "settings search",
+            "light theme",
+        ];
+        let mut seen = [false; 28];
+        let duration = Script::WhatsNew.duration().as_secs_f32();
+        let group = super::super::SAMPLES[1].id;
+        for frame in 0..=((duration + 1.0) * 60.0) as usize {
+            let at = frame as f32 / 60.0;
+            // The recorder hears in real time; give it three real seconds.
+            if (55.9..59.1).contains(&at) {
+                std::thread::sleep(Duration::from_millis(16));
+            }
+            let mut input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0))),
+                time: Some(at as f64),
+                ..Default::default()
+            };
+            if frame > 0 {
+                tour.input_at(&mut app, &ctx, &mut input, at);
+            }
+            let mut output = ctx.run_ui(input, |ui| {
+                app.background_frame(&ctx);
+                app.frame_ui(ui);
+                tour.observe(&mut app, &ctx);
+                let hovered = Tour::bubble(&app, &ctx, "group-reply")
+                    .is_some_and(|rect| rect.contains(tour.pointer));
+                let checks = [
+                    app.composer_tools_open,
+                    matches!(app.dialog, Some(Dialog::CreatePoll(_))),
+                    app.chat_search_open && app.chat_search_hits.len() >= 3,
+                    app.chat_search_calendar,
+                    app.chat_search_day.is_some() && !app.chat_search_hits.is_empty(),
+                    app.jump_highlight.is_some(),
+                    app.image_preview.is_some(),
+                    app.image_preview
+                        .as_ref()
+                        .is_some_and(|preview| !preview.is_fit()),
+                    app.video.status(whats_new::VIDEO).is_some(),
+                    app.video.status(whats_new::NOTE).is_some(),
+                    app.picker == Some(PickerTab::Stickers)
+                        && app.sticker_shelf == StickerShelf::Favorites,
+                    app.picker == Some(PickerTab::Stickers)
+                        && matches!(app.sticker_shelf, StickerShelf::Pack(_)),
+                    app.sticker_search == "🐸",
+                    app.sticker_search == "bom dia",
+                    matches!(app.dialog, Some(Dialog::MessageInfo { .. }))
+                        && app.message_receipts.is_some(),
+                    app.chat_filter == crate::model::ChatFilter::Favorites,
+                    app.label_filter.as_deref() == Some("label-work"),
+                    tour.labels.contains_key("Mark as unread")
+                        && tour.labels.contains_key("Follow up")
+                        && egui::Popup::is_any_open(&ctx),
+                    app.recording.is_some(),
+                    app.conversations[group].message("tour-voice").is_some(),
+                    app.player.speed() == 1.75,
+                    app.sidebar_mode() == crate::model::SidebarDisplayMode::CollapsedIconsOnly,
+                    hovered && app.selection.is_none(),
+                    app.selection
+                        .as_ref()
+                        .is_some_and(|(_, selected)| selected.len() >= 2),
+                    matches!(app.dialog, Some(Dialog::Forward { .. })),
+                    app.page == Page::Settings && tour.labels.contains_key("Русский"),
+                    app.settings_search == "privacy" && tour.labels.contains_key("Last seen"),
+                    app.settings.theme == ThemeChoice::Light,
+                ];
+                for (seen, check) in seen.iter_mut().zip(checks) {
+                    *seen |= check;
+                }
+            });
+            output.textures_delta.clear();
+            assert!(
+                !tour.failed,
+                "missing target at {at:.2}s, cue {}",
+                tour.next
+            );
+        }
+        let missing: Vec<_> = features
+            .iter()
+            .zip(seen)
+            .filter(|(_, seen)| !seen)
+            .map(|(feature, _)| *feature)
+            .collect();
+        assert!(missing.is_empty(), "never shown: {missing:?}");
+        // It ends in the light theme, back in the chats, in English, with
+        // nothing left open.
+        assert_eq!(app.page, Page::Chats);
+        assert_eq!(app.open_chat.as_deref(), Some(group));
+        assert_eq!(app.settings.theme, ThemeChoice::Light);
+        assert_eq!(
+            app.settings.interface_language,
+            Some(crate::i18n::Locale::English)
+        );
+        assert!(app.dialog.is_none());
+        assert!(app.selection.is_none());
+        assert!(app.recording.is_none());
+        assert!(app.image_preview.is_none());
+        assert!(app.backend.is_offline());
+    }
+
+    /// A click on the info panel's timer row opens its choices, and one
+    /// picked asks for that timer.
+    #[test]
+    fn a_click_opens_the_disappearing_timer_menu() {
+        let mut app = super::super::tests::app();
+        prepare(&mut app);
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        app.backend.record_demo_commands();
+        let mut tour = Tour::new(None, None);
+        let ada = super::super::sample_ids()[0].to_owned();
+        app.actions
+            .push(crate::model::Action::OpenChat(ada.clone()));
+        frame(&mut app, &mut tour, &ctx, Vec::new());
+        app.actions
+            .push(crate::model::Action::OpenInfo(ada.clone()));
+        for _ in 0..3 {
+            frame(&mut app, &mut tour, &ctx, Vec::new());
+        }
+        let row = crate::i18n::gettext(app.locale, "Disappearing messages").to_string();
+        click(&mut app, &mut tour, &ctx, &row);
+        let week = crate::i18n::gettext(app.locale, "7 days").to_string();
+        assert!(tour.labels.contains_key(&week), "the choices show");
+        click(&mut app, &mut tour, &ctx, &week);
+        assert_eq!(
+            app.chat(&ada).and_then(|chat| chat.ephemeral_expiration),
+            Some(604_800),
+            "the pick goes out and the reply sets it"
+        );
+    }
+
+    /// Plays `script` at 60 frames a second at the capture's size, calling
+    /// `each` after every frame, and fails at the first missing target.
+    fn play(script: Script, mut each: impl FnMut(&mut App, &Tour, &egui::Context)) -> App {
+        let mut app = super::super::tests::app();
+        script.prepare(&mut app);
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let mut tour = Tour::scripted(script, None, None, None);
+        let duration = script.duration().as_secs_f32();
+        for frame in 0..=((duration + 1.0) * 60.0) as usize {
+            let at = frame as f32 / 60.0;
+            let mut input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1180.0, 780.0))),
+                time: Some(at as f64),
+                ..Default::default()
+            };
+            if frame > 0 {
+                tour.input_at(&mut app, &ctx, &mut input, at);
+            }
+            let mut output = ctx.run_ui(input, |ui| {
+                app.background_frame(&ctx);
+                app.frame_ui(ui);
+                tour.observe(&mut app, &ctx);
+            });
+            output.textures_delta.clear();
+            each(&mut app, &tour, &ctx);
+            assert!(
+                !tour.failed,
+                "missing target at {at:.2}s, cue {}",
+                tour.next
+            );
+        }
+        app
+    }
+
+    /// Reports which of `features` `checks` never saw.
+    fn never_shown(features: &[&str], seen: &[bool]) {
+        let missing: Vec<_> = features
+            .iter()
+            .zip(seen)
+            .filter(|(_, seen)| !**seen)
+            .map(|(feature, _)| *feature)
+            .collect();
+        assert!(missing.is_empty(), "never shown: {missing:?}");
+    }
+
+    #[test]
+    fn the_calls_tour_places_answers_and_hangs_up_through_real_input() {
+        use crate::calls::CallPhase;
+        let features = [
+            "placing",
+            "calling",
+            "ringing",
+            "video call with both pictures",
+            "muted",
+            "device pickers",
+            "entry in the chat",
+            "incoming voice call",
+            "voice call answered",
+            "everyone invited",
+            "group video call, three cameras and Tom without",
+            "call history",
+        ];
+        let mut seen = [false; 12];
+        let ada = super::super::SAMPLES[0].id;
+        let grace = super::super::SAMPLES[2].id;
+        let group = super::super::SAMPLES[1].id;
+        let filed = |app: &App, chat: &str| {
+            app.conversations[chat]
+                .messages
+                .iter()
+                .any(|row| row.id.starts_with(calls::ENTRY))
+        };
+        let app = play(Script::Calls, |app, _, _| {
+            let call = app.call.as_ref();
+            let phase = call.map(|call| call.phase);
+            let group_call = call.and_then(|call| call.group.as_ref());
+            let checks = [
+                phase == Some(CallPhase::Placing),
+                phase == Some(CallPhase::Dialing) && app.call_local_frame.is_some(),
+                phase == Some(CallPhase::Ringing),
+                phase == Some(CallPhase::Active)
+                    && group_call.is_none()
+                    && app.call_remote_frame.is_some()
+                    && app.call_local_frame.is_some(),
+                call.is_some_and(|call| call.muted),
+                app.call_devices_open,
+                app.call.is_none() && filed(app, ada),
+                phase == Some(CallPhase::Incoming) && call.is_some_and(|call| call.chat == grace),
+                phase == Some(CallPhase::Active)
+                    && call.is_some_and(|call| !call.video && call.chat == grace),
+                group_call.is_some_and(|group| {
+                    !group.participants.is_empty()
+                        && group.participants.iter().all(|person| !person.joined)
+                }),
+                group_call.is_some_and(|group| {
+                    group.participants.iter().all(|person| person.joined)
+                        && group
+                            .participants
+                            .iter()
+                            .filter(|person| person.video)
+                            .count()
+                            == 3
+                }) && app.call_member_frames.len() == 3
+                    && app.call_local_frame.is_some(),
+                app.page == Page::Calls
+                    && app
+                        .call_log
+                        .iter()
+                        .filter(|row| row.id.starts_with(calls::ENTRY))
+                        .count()
+                        == 3,
+            ];
+            for (seen, check) in seen.iter_mut().zip(checks) {
+                *seen |= check;
+            }
+        });
+        never_shown(&features, &seen);
+        assert!(app.call.is_none(), "every call hung up");
+        assert!(filed(&app, grace) && filed(&app, group));
+        assert!(!app.call_devices_open);
+        assert!(app.backend.is_offline());
+    }
+
+    #[test]
+    fn the_whats_new_21_tour_reaches_every_feature_through_real_input() {
+        use crate::model::Content;
+        let features = [
+            "link card above the field",
+            "link card on the sent bubble",
+            "two photos under review",
+            "caption typed",
+            "two upload strips",
+            "one upload cancelled",
+            "photo sent",
+            "who reacted",
+            "format menu",
+            "bold word sent",
+            "GIF results",
+            "more GIFs loaded",
+            "disappearing messages on",
+            "contact blocked",
+            "export dialog",
+            "attachments ticked and unticked",
+            "account muted",
+        ];
+        let mut seen = [false; 17];
+        let ada = super::super::SAMPLES[0].id;
+        let group = super::super::SAMPLES[1].id;
+        let katherine = super::super::SAMPLES[3].id;
+        let mut first_gifs = None;
+        let mut exports = [false; 2];
+        let app = play(Script::WhatsNew21, |app, tour, ctx| {
+            let last_text = |chat: &str| {
+                app.conversations[chat]
+                    .messages
+                    .last()
+                    .map(|row| row.content.full_summary())
+                    .unwrap_or_default()
+            };
+            let gifs = app.gif_results.len();
+            if app.picker == Some(PickerTab::Gifs) {
+                first_gifs.get_or_insert(gifs);
+            }
+            if let Some(Dialog::ExportChat { include_media, .. }) = &app.dialog {
+                exports[usize::from(*include_media)] = true;
+            }
+            let reactions =
+                crate::ui::conversation::bubble_id(group, "group-photo").with("reaction-list");
+            let checks = [
+                matches!(
+                    app.composer_preview.as_ref().map(|preview| &preview.state),
+                    Some(crate::app::LinkPreviewState::Ready(_))
+                ),
+                app.conversations[ada].messages.iter().any(|row| {
+                    row.id.starts_with("tour-")
+                        && matches!(
+                            &row.content,
+                            Content::Text {
+                                preview: Some(_),
+                                ..
+                            }
+                        )
+                }),
+                // Files on disk, so the review shows the pictures.
+                app.pending.len() == 2
+                    && app.pending.iter().all(|staged| {
+                        matches!(&staged.item, crate::app::Pending::File(path) if path.is_file())
+                    }),
+                app.pending.len() == 2 && app.composer == whats_new_21::CAPTION,
+                app.uploads.len() == 2,
+                app.uploads.len() == 1 && app.uploads[0].percent >= 71,
+                app.conversations[ada].message("tour-photo").is_some(),
+                egui::Popup::is_id_open(ctx, reactions),
+                tour.labels.contains_key("Bold")
+                    && tour.labels.contains_key("Monospace")
+                    && egui::Popup::is_any_open(ctx),
+                last_text(group).contains("*tonight*"),
+                app.picker == Some(PickerTab::Gifs) && gifs > 0,
+                first_gifs.is_some_and(|first| gifs > first)
+                    && app.gif_results.iter().all(|gif| {
+                        gif.animated.as_ref().is_some_and(|path| path.is_file())
+                    })
+                    && app.gif_results[..6]
+                        .iter()
+                        .map(|gif| gif.animated.clone())
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        == 6,
+                app.chat(katherine)
+                    .and_then(|chat| chat.ephemeral_expiration)
+                    == Some(604_800),
+                app.blocklist.contains(katherine),
+                exports.iter().any(|seen| *seen),
+                exports == [true; 2],
+                app.accounts.len() > 1 && !app.accounts[1].settings.notifications,
+            ];
+            for (seen, check) in seen.iter_mut().zip(checks) {
+                *seen |= check;
+            }
+        });
+        never_shown(&features, &seen);
+        assert_eq!(app.page, Page::Chats);
+        assert_eq!(app.open_chat.as_deref(), Some(katherine));
+        assert!(app.dialog.is_none());
+        assert!(app.uploads.is_empty());
+        assert!(app.backend.is_offline());
+    }
+
+    #[test]
+    fn real_input_opens_menus_completes_text_and_sends_offline_media() {
+        let mut app = super::super::tests::app();
+        prepare(&mut app);
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let mut tour = Tour::new(None, None);
+        let mut seen = [false; 7];
+        for frame in 0..=42 * 60 {
+            let at = frame as f32 / 60.0;
+            let mut input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0))),
+                time: Some(at as f64),
+                ..Default::default()
+            };
+            // Give the first screen a frame to establish its hit targets.
+            if frame > 0 {
+                tour.input_at(&mut app, &ctx, &mut input, at);
+            }
+            let mut output = ctx.run_ui(input, |ui| {
+                app.background_frame(&ctx);
+                app.frame_ui(ui);
+                tour.observe(&mut app, &ctx);
+                seen[0] |= egui::Popup::is_any_open(&ctx);
+                seen[1] |= app.reply_to.is_some();
+                seen[2] |= app.picker == Some(PickerTab::Gifs);
+                seen[3] |= app.picker == Some(PickerTab::Stickers);
+                seen[4] |= app.info.is_some();
+                seen[5] |= matches!(app.dialog, Some(Dialog::Shortcuts));
+                seen[6] |= app.settings.theme == ThemeChoice::Light;
+            });
+            output.textures_delta.clear();
+            assert!(
+                !tour.failed,
+                "missing target at {at:.2}s, cue {}",
+                tour.next
+            );
+        }
+        assert_eq!(
+            seen, [true; 7],
+            "every advertised interaction must be visible"
+        );
+        let ada = &app.conversations[super::super::SAMPLES[0].id];
+        let sent: Vec<_> = ada
+            .messages
+            .iter()
+            .filter(|row| row.id.starts_with("tour-"))
+            .collect();
+        assert_eq!(
+            sent.len(),
+            2,
+            "reply and still sticker through real send commands"
+        );
+        assert!(sent[0].quoted.is_some());
+        assert!(matches!(&sent[0].content, Content::Text { text, .. }
+            if text.starts_with("See you tonight! ") && !text.contains(':')));
+        assert!(
+            matches!(&sent[1].content, Content::Sticker { animated: false, media }
+            if media.path.as_ref().unwrap().is_file())
+        );
+        for row in &ada.messages {
+            assert!(!matches!(
+                row.content,
+                Content::Sticker { animated: true, .. }
+            ));
+        }
+        let group = &app.conversations[super::super::SAMPLES[1].id];
+        assert_eq!(group.messages.last().unwrap().mentions.len(), 1);
+        assert_eq!(app.settings.theme, ThemeChoice::Dark);
+        assert!(app.backend.is_offline());
+        assert!(app.composer.is_empty());
+        assert!(app.dialog.is_none());
+
+        let mut input = egui::RawInput::default();
+        input.events.push(Event::Key {
+            key: Key::Space,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        });
+        input.events.push(Event::Text(" ".into()));
+        tour.input(&mut app, &ctx, &mut input);
+        assert_eq!(tour.next, 1, "replay immediately runs the first shortcut");
+        assert!(
+            app.conversations[super::super::SAMPLES[0].id]
+                .messages
+                .iter()
+                .all(|row| !row.id.starts_with("tour-"))
+        );
+    }
+}

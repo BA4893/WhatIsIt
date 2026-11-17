@@ -1,18 +1,12 @@
 //! WhatIsIt server — a whatsapp-rust backend exposing HTTP + WebSocket for the
 //! HarmonyOS app: QR pairing, chats, messages, media.
 
-mod calls;
-mod events;
-mod history;
-mod media;
-mod store;
-mod state;
-mod web;
-
 use anyhow::Result;
 use std::sync::Arc;
 
-use state::AppState;
+use whatisit_server::events;
+use whatisit_server::state::AppState;
+use whatisit_server::web;
 
 #[tokio::main]
 async fn main() -> Result<()> {

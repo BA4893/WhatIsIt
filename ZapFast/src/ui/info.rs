@@ -1,0 +1,2462 @@
+//! The info panel beside the open chat: a contact's, group's or channel's
+//! picture, name and actions, its members, and the pictures, videos,
+//! documents and links shared in it. It takes a column at the right, and
+//! the conversation narrows beside it; when the chat list leaves too little
+//! room, the list steps aside. In the narrow window mode it is a page of its
+//! own over the chat, with Back.
+
+use egui::{Align, Align2, Color32, CornerRadius, Frame, Margin, Rect, Sense, Stroke, Vec2};
+use egui::{pos2, vec2};
+
+use crate::app::{App, InfoFocus};
+use crate::model::{Action, ChatMedia, Content, Dialog, InfoView, MediaTab, Message};
+use crate::theme::{self, Icon};
+
+use super::focus::{Stop, TabStop};
+use super::pane::{self, Docking};
+use super::widgets;
+
+/// The panel's side margin.
+const MARGIN: f32 = 14.0;
+/// Space between the cells of the picture grid and strip.
+const GAP: f32 = 4.0;
+/// A document or link row.
+const ROW_HEIGHT: f32 = 60.0;
+/// The panel's Tab stops after its close button, in reading order: the
+/// group photo, the rename pencil, the name editor's check, the action
+/// buttons, the media row, the group's permissions row, Add members, the
+/// invite link's buttons, the media view's tabs (or the permission
+/// switches), Leave, and Try again; a person's groups in common come last, one
+/// stop per row.
+const PHOTO_STOP: u8 = 0;
+const PENCIL_STOP: u8 = 1;
+const NAME_CHECK_STOP: u8 = 2;
+const ACTION_STOP: u8 = 3;
+const BLOCK_STOP: u8 = 9;
+pub const MEDIA_ROW_STOP: u8 = 10;
+const PERMISSIONS_STOP: u8 = 11;
+const ADD_MEMBERS_STOP: u8 = 12;
+const COPY_LINK_STOP: u8 = 13;
+const RESET_LINK_STOP: u8 = 14;
+const TAB_STOP: u8 = 20;
+const LEAVE_STOP: u8 = 30;
+const RETRY_STOP: u8 = 31;
+const TIMER_STOP: u8 = 32;
+const GROUPS_STOP: u8 = 40;
+
+/// The media view's title, and the overview row that opens it.
+fn media_title(app: &App) -> String {
+    crate::i18n::gettext(app.locale, "Media, links and docs").into_owned()
+}
+
+/// The texture name a listed picture's preview is drawn under: the panel's
+/// own, so freeing it when the panel closes leaves the bubbles' alone.
+pub(crate) fn thumbnail_uri(chat: &str, id: &str) -> String {
+    format!(
+        "bytes://info-{}-{}",
+        chat.chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>(),
+        id
+    )
+}
+
+/// Frees the pictures the panel no longer lists. Called on every frame,
+/// the lock and login screens included, so a closed panel's pictures do
+/// not wait for the chats to be drawn again.
+pub fn release_thumbnails(app: &mut App, ctx: &egui::Context) {
+    for uri in std::mem::take(&mut app.info_released) {
+        app.info_textures.remove(&uri);
+        crate::image_cache::forget(ctx, &uri);
+    }
+}
+
+/// Docks the panel when there is room, before the conversation is laid out.
+/// Otherwise returns the conversation's rect for [`show_overlay`], drawn
+/// after the conversation so it lies on top.
+pub fn show(app: &mut App, ui: &mut egui::Ui) -> Option<Rect> {
+    if !app.info_visible() {
+        ui.ctx().data_mut(|data| data.remove::<bool>(docked_id()));
+        // The thumbnails go with the panel, not with the resident window.
+        for uri in std::mem::take(&mut app.info_textures) {
+            crate::image_cache::forget(ui.ctx(), &uri);
+        }
+        return None;
+    }
+    // A narrow window shows the panel as a page of its own over the chat.
+    if super::narrow(ui.ctx()) {
+        return Some(ui.available_rect_before_wrap());
+    }
+    // Otherwise it takes a column beside the conversation, which narrows.
+    let wanted = app.settings.info_pane_width;
+    match pane::docked(
+        app,
+        ui,
+        "chat-info-pane",
+        wanted,
+        pane::INFO_MIN,
+        pane::INFO_CONVERSATION_MIN,
+        |app, ui| contents(app, ui, false),
+    ) {
+        Docking::Docked { width, wanted } => {
+            // Only a drag moves the edge off the width asked for.
+            if (width - wanted).abs() > 1.0 {
+                app.settings.info_pane_width = width;
+                app.actions.push(Action::SettingsChanged);
+            }
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(docked_id(), true));
+            None
+        }
+        Docking::Overlay(region) => Some(region),
+    }
+}
+
+/// The panel as a page over the whole conversation in a narrow window.
+pub fn show_overlay(app: &mut App, ctx: &egui::Context, region: Rect) {
+    let width = region.width();
+    pane::overlay(app, ctx, "chat-info-overlay", width, region, |app, ui| {
+        contents(app, ui, true)
+    });
+    ctx.data_mut(|data| data.insert_temp(docked_id(), false));
+}
+
+/// Whether the panel was docked (`true`) or laid over the chat (`false`)
+/// this frame, for interaction tests.
+pub fn docked_id() -> egui::Id {
+    egui::Id::new("chat-info-docked")
+}
+
+/// The panel's contents. Over a narrow conversation (`overlay`) an item
+/// that goes to a message closes the panel, so the message can be seen.
+fn contents(app: &mut App, ui: &mut egui::Ui, overlay: bool) {
+    let (chat, view) = match &app.info {
+        Some(info) => (info.chat.clone(), info.view),
+        None => return,
+    };
+    match view {
+        InfoView::Overview => overview(app, ui, &chat, overlay),
+        // A locked chat's media is never drawn: the overview shows instead.
+        InfoView::Media(_) if !app.info_media_allowed() => {
+            app.actions.push(Action::ShowInfo(InfoView::Overview));
+            overview(app, ui, &chat, overlay);
+        }
+        InfoView::Media(tab) => media_view(app, ui, &chat, tab, overlay),
+        // Only the group's admins see its permissions.
+        InfoView::Permissions
+            if !app
+                .chat(&chat)
+                .is_some_and(crate::model::Chat::can_manage_group) =>
+        {
+            app.actions.push(Action::ShowInfo(InfoView::Overview));
+            overview(app, ui, &chat, overlay);
+        }
+        InfoView::Permissions => permissions_view(app, ui, &chat),
+    }
+}
+
+/// The pane-style header: a button at the left, then the title. `focus`
+/// says whether the keyboard moves to the button this frame.
+fn header(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    title: &str,
+    action: Action,
+    focus: bool,
+) {
+    let palette = app.palette;
+    let top = ui.cursor().top();
+    let frame = Frame::new()
+        .inner_margin(Margin::symmetric(14, 8))
+        .show(ui, |ui| {
+            let room = pane::caption_header(ui, vec2(14.0, 8.0));
+            ui.horizontal(|ui| {
+                ui.set_min_height(super::conversation::HEADER_ROW);
+                ui.add_space(room.left);
+                let button =
+                    theme::icon_button(ui, icon, 18.0, palette.secondary, palette.text, label)
+                        .tab_stop(Stop::InfoClose);
+                if focus {
+                    button.request_focus();
+                }
+                if button.clicked() {
+                    app.actions.push(action);
+                }
+                ui.add_space(6.0);
+                theme::text(ui, title, theme::semibold(16.0), palette.text);
+            });
+        })
+        .response
+        .rect;
+    // The edge is the chat header's beside it, whichever of the two would be
+    // taller on its own: their rows differ by a few points with some fonts.
+    let chat_header = ui
+        .ctx()
+        .data(|data| data.get_temp::<Rect>(super::conversation::header_rect_id()));
+    let bottom = chat_header
+        .filter(|chat| (chat.top() - top).abs() < 1.0)
+        .map_or(frame.bottom(), |chat| chat.bottom());
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(header_edge_id(), bottom));
+    let short = bottom - ui.cursor().top();
+    if short > 0.0 {
+        ui.add_space(short);
+    }
+    // A vibrant chat header has no edge (its messages scroll on under it),
+    // so this one draws none either.
+    if !palette.vibrant() {
+        ui.painter().hline(
+            ui.max_rect().x_range(),
+            bottom,
+            Stroke::new(1.0, palette.outline),
+        );
+    }
+}
+
+/// Where the pane header's edge was last drawn, for layout tests.
+pub(crate) fn header_edge_id() -> egui::Id {
+    egui::Id::new("info-header-edge")
+}
+
+/// What the overview shows of the chat, read once per frame from the chat
+/// list without copying its member list.
+struct Shown {
+    id: String,
+    /// The name the chat list shows.
+    name: String,
+    /// The group's subject as the phone named it, for the rename editor.
+    subject: String,
+    subject_known: bool,
+    has_chat: bool,
+    group: bool,
+    channel: bool,
+    phone: Option<String>,
+    members: usize,
+    can_leave: bool,
+    can_edit_info: bool,
+    can_add: bool,
+    can_share_link: bool,
+    can_manage: bool,
+    muted_until: Option<i64>,
+    muted: bool,
+    pinned: bool,
+    archived: bool,
+    /// A chat we have left. It stays readable but takes no new settings.
+    left: bool,
+    /// A group's description, when it has one.
+    description: Option<String>,
+    /// The disappearing-message timer line, when the timer is known.
+    timer: Option<String>,
+    timer_seconds: Option<u32>,
+}
+
+impl Shown {
+    fn of(app: &App, id: &str) -> Self {
+        // Group members may not have an existing chat.
+        let fallback;
+        let (chat, has_chat) = match app.chat(id) {
+            Some(chat) => (chat, true),
+            None => {
+                fallback = crate::model::Chat::new(id.to_owned(), app.display_name(id));
+                (&fallback, false)
+            }
+        };
+        let ours = app.our_ids();
+        Self {
+            id: chat.id.clone(),
+            name: app.chat_title(chat),
+            subject: chat.name.clone(),
+            subject_known: chat.group_subject_known,
+            has_chat,
+            group: chat.is_group(),
+            channel: chat.is_channel(),
+            phone: chat.phone().map(str::to_owned),
+            members: chat.participants.len(),
+            can_leave: chat.can_leave(&ours),
+            can_edit_info: chat.can_edit_info(),
+            can_add: chat.can_add_members(),
+            can_share_link: chat.can_share_invite_link(),
+            can_manage: chat.can_manage_group(),
+            muted_until: chat.muted_until,
+            muted: chat.muted(crate::util::now()),
+            pinned: chat.pinned,
+            archived: chat.archived,
+            left: chat.left,
+            description: chat
+                .group_description
+                .clone()
+                .filter(|text| chat.is_group() && !text.trim().is_empty()),
+            timer: crate::util::disappearing_line(app.locale, chat.ephemeral_expiration),
+            timer_seconds: chat.ephemeral_expiration,
+        }
+    }
+}
+
+/// The chat's picture, name, details, actions and members.
+fn overview(app: &mut App, ui: &mut egui::Ui, id: &str, overlay: bool) {
+    let shown = Shown::of(app, id);
+    let title = if shown.group {
+        crate::i18n::gettext(app.locale, "Group info")
+    } else if shown.channel {
+        crate::i18n::gettext(app.locale, "Channel info")
+    } else {
+        crate::i18n::gettext(app.locale, "Contact info")
+    };
+    // As a page of its own, the panel goes back to the chat it covers.
+    let (icon, close) = if overlay {
+        (Icon::ChevronLeft, crate::i18n::gettext(app.locale, "Back"))
+    } else {
+        (Icon::X, crate::i18n::gettext(app.locale, "Close"))
+    };
+    header(app, ui, icon, &close, &title, Action::CloseInfo, false);
+    crate::ui::bounce::ScrollArea::vertical()
+        .id_salt(("chat-info", id))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            Frame::new()
+                .inner_margin(Margin::symmetric(MARGIN as i8, 12))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    identity(app, ui, &shown, overlay);
+                });
+        });
+}
+
+/// Opens a profile picture in the image viewer. It belongs to no message, so
+/// the viewer has no album of a chat to browse from it.
+fn view_photo(picture: &std::path::Path) -> Action {
+    Action::PreviewImage {
+        path: picture.to_path_buf(),
+        chat: String::new(),
+        message: String::new(),
+        card: None,
+    }
+}
+
+/// The picture, name, details, actions and members, top to bottom.
+fn identity(app: &mut App, ui: &mut egui::Ui, shown: &Shown, overlay: bool) {
+    let palette = app.palette;
+    let id = shown.id.as_str();
+    let name = shown.name.as_str();
+    // The photo takes the panel's width, up to a portrait size.
+    let window = ui.ctx().content_rect().height();
+    let photo = (ui.available_width() * 0.55).clamp(120.0, 200.0);
+    let picture = app.avatar_full(id).or_else(|| app.avatar(id));
+    let mine = app.me.as_deref() == Some(id);
+    let editable = shown.phone.is_some() && !mine;
+    // Saving or cancelling leaves the editor buffer checked out.
+    let mut editing = app.contact_edit.take().filter(|_| editable);
+    let mut saved = None;
+    let mut leave = false;
+    // A group's name and photo, when WhatsApp lets us change them. Nothing is
+    // offered while a change is on its way.
+    let saving = app.group_saving.contains(id);
+    let group_editable = shown.can_edit_info && !saving;
+    let mut renaming = app.group_name_edit.take().filter(|_| group_editable);
+    let mut group_action = None;
+    ui.vertical_centered(|ui| {
+        if group_editable {
+            group_action = group_photo(app, ui, name, id, photo, picture.as_deref());
+        } else if let Some(picture) = picture.as_deref() {
+            let label = crate::i18n::gettext(app.locale, "View photo");
+            if widgets::clickable_avatar(ui, &palette, name, id, photo, Some(picture), &label)
+                .tab_stop(Stop::InfoControl(PHOTO_STOP))
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(label.as_ref())
+                .clicked()
+            {
+                app.actions.push(view_photo(picture));
+            }
+        } else {
+            widgets::avatar(ui, &palette, name, id, photo, None);
+        }
+        ui.add_space(6.0);
+        if let Some(draft) = renaming.as_mut() {
+            match group_name_field(app, ui, draft) {
+                Some(true) => {
+                    let typed = draft.trim();
+                    // An empty or unchanged name closes the editor and sends nothing.
+                    group_action = Some(if typed.is_empty() || typed == shown.subject {
+                        Action::CloseGroupName
+                    } else {
+                        Action::SetGroupName {
+                            chat: id.to_owned(),
+                            name: typed.to_owned(),
+                        }
+                    });
+                }
+                Some(false) => group_action = Some(Action::CloseGroupName),
+                None => {}
+            }
+        } else if group_editable {
+            let edit = crate::i18n::gettext(app.locale, "Edit group name");
+            // Center the name and its pencil together.
+            let button = 15.0 + 12.0;
+            let spacing = ui.spacing().item_spacing.x;
+            let available = ui.available_width();
+            let text_width = widgets::line(
+                ui,
+                name,
+                theme::bold(19.0),
+                palette.text,
+                (available - button - spacing).max(40.0),
+                1,
+            )
+            .size()
+            .x;
+            ui.horizontal(|ui| {
+                ui.add_space(((available - text_width - spacing - button) / 2.0).max(0.0));
+                ui.allocate_ui(vec2(text_width + 1.0, 30.0), |ui| {
+                    widgets::selectable_rich_text(ui, name, theme::bold(19.0), palette.text);
+                });
+                let pencil = theme::icon_button(
+                    ui,
+                    Icon::Pencil,
+                    15.0,
+                    palette.secondary,
+                    palette.text,
+                    &edit,
+                )
+                .tab_stop(Stop::InfoControl(PENCIL_STOP));
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(group_name_button_id(), pencil.rect));
+                if pencil.clicked() {
+                    // The field appears next frame; egui keeps a focus
+                    // request that long.
+                    ui.memory_mut(|memory| memory.request_focus(group_name_field_id()));
+                    // An unnamed group starts empty rather than from its
+                    // members' summary, the title `chat_title` falls back to.
+                    let unnamed = shown.subject.trim().is_empty()
+                        || (shown.subject == "Group" && !shown.subject_known);
+                    group_action = Some(Action::EditGroupName(if unnamed {
+                        String::new()
+                    } else {
+                        shown.subject.clone()
+                    }));
+                }
+            });
+        } else if let Some((first, last)) = editing.as_mut() {
+            let mut submit = false;
+            ui.horizontal(|ui| {
+                ui.add_space((ui.available_width() - 288.0).max(0.0) / 2.0);
+                let name_field = |ui: &mut egui::Ui, buffer: &mut String, salt: &str, hint| {
+                    let format = egui::TextFormat::simple(theme::semibold(15.0), palette.text);
+                    let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap: f32| {
+                        crate::bidi::layout_field(ui, text.as_str(), &format, wrap)
+                    };
+                    let align = if crate::bidi::base_rtl(buffer) {
+                        Align::RIGHT
+                    } else {
+                        Align::LEFT
+                    };
+                    let field = Frame::new()
+                        .fill(palette.surface)
+                        .corner_radius(CornerRadius::same(theme::RADIUS))
+                        .inner_margin(Margin::symmetric(10, 5))
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(buffer)
+                                    .id(egui::Id::new(salt))
+                                    .hint_text(
+                                        egui::RichText::new(hint)
+                                            .color(palette.dim)
+                                            .font(theme::semibold(15.0)),
+                                    )
+                                    .font(theme::semibold(15.0))
+                                    .text_color(palette.text)
+                                    .frame(Frame::NONE)
+                                    .desired_width(108.0)
+                                    .horizontal_align(align)
+                                    .layouter(&mut layouter),
+                            )
+                        });
+                    theme::focus_outline(
+                        ui,
+                        field.inner.id,
+                        field.response.rect,
+                        f32::from(theme::RADIUS),
+                    );
+                    field.inner
+                };
+                let first_field = name_field(ui, first, "contact-first", "First name");
+                let last_field = name_field(ui, last, "contact-last", "Surname");
+                if ui.memory(|memory| memory.focused().is_none()) {
+                    first_field.request_focus();
+                }
+                submit = (first_field.lost_focus() || last_field.lost_focus())
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                if theme::icon_button(
+                    ui,
+                    Icon::Check,
+                    18.0,
+                    palette.secondary,
+                    palette.accent,
+                    "Save name (Enter)",
+                )
+                .tab_stop(Stop::InfoControl(NAME_CHECK_STOP))
+                .clicked()
+                {
+                    submit = true;
+                }
+            });
+            if submit && !(first.trim().is_empty() && last.trim().is_empty()) {
+                saved = Some((first.trim().to_owned(), last.trim().to_owned()));
+            }
+        } else {
+            widgets::selectable_rich_text(ui, name, theme::bold(19.0), palette.text);
+        }
+        if let Some(phone) = &shown.phone {
+            theme::selectable_text(
+                ui,
+                crate::util::phone(phone),
+                theme::regular(13.5),
+                palette.secondary,
+            );
+        }
+        if saving {
+            theme::text(
+                ui,
+                crate::i18n::gettext(app.locale, "Saving…"),
+                theme::regular(12.5),
+                palette.dim,
+            );
+        }
+        if shown.group && shown.members > 0 {
+            theme::text(
+                ui,
+                crate::i18n::ngettext(app.locale, "{} member", "{} members", shown.members as u32)
+                    .replace("{}", &shown.members.to_string()),
+                theme::regular(13.5),
+                palette.secondary,
+            );
+        }
+        if let Some(presence) = app.presence.get(id) {
+            let status = if presence.online {
+                "online".to_owned()
+            } else if let Some(seen) = presence.last_seen {
+                crate::util::last_seen(app.locale, seen)
+            } else {
+                String::new()
+            };
+            if !status.is_empty() {
+                theme::text(ui, status, theme::regular(12.5), palette.dim);
+            }
+        }
+        if let Some(until) = shown.muted_until {
+            theme::text(
+                ui,
+                if until == 0 {
+                    "Muted".to_owned()
+                } else {
+                    format!("Muted until {}", crate::util::chat_stamp(app.locale, until))
+                },
+                theme::regular(12.5),
+                palette.secondary,
+            );
+        }
+        // Keep a known timer visible even when the group's permissions make
+        // it read-only. An editable chat with no known timer still offers the
+        // choice without guessing "Off". Record the marker every frame so a
+        // hidden row cannot leave the previous chat's value behind.
+        let eligible = shown.has_chat && !shown.channel && !shown.left;
+        let changeable = eligible && (!shown.group || shown.can_edit_info);
+        let showable = eligible && (changeable || shown.timer.is_some());
+        let label = shown.timer.clone().unwrap_or_else(|| {
+            crate::i18n::gettext(app.locale, "Disappearing messages").into_owned()
+        });
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                super::dialogs::disappearing_timer_id(),
+                showable.then(|| super::dialogs::TimerRow {
+                    text: label.clone(),
+                    rect: Rect::NOTHING,
+                }),
+            )
+        });
+        if showable {
+            let text = label.as_str();
+            // A hover highlight painted under the row: the placeholder is
+            // added first and filled in once the row's rect is known.
+            let painter = ui.painter().clone();
+            let highlight = painter.add(egui::Shape::Noop);
+            let drawn = super::dialogs::disappearing_timer_row(ui, &palette, text);
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(super::dialogs::disappearing_timer_id(), Some(drawn.clone()))
+            });
+            let saving = app.timer_saving.contains(id);
+            let can_change = changeable && !saving;
+            let response = ui.interact(
+                drawn.rect.expand2(vec2(8.0, 4.0)),
+                egui::Id::new(("disappearing-timer-control", id)),
+                if can_change {
+                    Sense::click()
+                } else {
+                    Sense::hover()
+                },
+            );
+            let response = if can_change {
+                response.tab_stop(Stop::InfoControl(TIMER_STOP))
+            } else {
+                response
+            };
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, can_change, text)
+            });
+            // Keyboard focus shows the same way the media row's does.
+            theme::reveal_focus(&response);
+            theme::focus_outline(ui, response.id, drawn.rect.expand2(vec2(8.0, 4.0)), 6.0);
+            // A clickable row reads as one: the pointer changes over it and a
+            // soft fill appears behind it. The placeholder was added before
+            // the row, so the fill stays under its icon and text.
+            if can_change && response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                painter.set(
+                    highlight,
+                    egui::Shape::rect_filled(
+                        drawn.rect.expand2(vec2(8.0, 4.0)),
+                        6.0,
+                        palette.surface_hover,
+                    ),
+                );
+            }
+            // Demo/test: hold this menu open for a screenshot.
+            #[cfg(any(test, feature = "demo"))]
+            if can_change && app.open_timer_menu.as_deref() == Some(id) {
+                egui::Popup::open_id(ui.ctx(), response.id.with("popup"));
+            }
+            let choices = [
+                (0, crate::i18n::gettext(app.locale, "Off")),
+                (86_400, crate::i18n::gettext(app.locale, "24 hours")),
+                (604_800, crate::i18n::gettext(app.locale, "7 days")),
+                (7_776_000, crate::i18n::gettext(app.locale, "90 days")),
+            ];
+            let mut selected = None;
+            egui::Popup::menu(&response)
+                // The click opens it, as any menu button's does; replacing
+                // that command with `None` would leave it shut for good.
+                .open_memory(if can_change {
+                    response.clicked().then_some(egui::SetOpenCommand::Toggle)
+                } else {
+                    Some(egui::SetOpenCommand::Bool(false))
+                })
+                .align(egui::RectAlign::BOTTOM)
+                .width(widgets::menu_width(
+                    ui,
+                    &choices
+                        .iter()
+                        .map(|(_, label)| label.as_ref())
+                        .collect::<Vec<_>>(),
+                    true,
+                ))
+                .frame(widgets::menu_frame(&palette))
+                .show(|ui| {
+                    for (seconds, label) in &choices {
+                        if widgets::menu_item_enabled(
+                            ui,
+                            &palette,
+                            (shown.timer_seconds == Some(*seconds)).then_some(Icon::Check),
+                            label,
+                            can_change,
+                        ) {
+                            selected = Some(*seconds);
+                            ui.close();
+                        }
+                    }
+                });
+            if let Some(seconds) = selected {
+                app.actions.push(Action::SetDisappearingTimer {
+                    chat: id.to_owned(),
+                    seconds,
+                });
+            }
+            // Both direct and group changes disable the row while waiting.
+            if saving {
+                theme::text(
+                    ui,
+                    crate::i18n::gettext(app.locale, "Saving…"),
+                    theme::regular(12.5),
+                    palette.dim,
+                );
+            }
+        }
+    });
+    if let Some((first, last)) = saved {
+        editing = None;
+        app.actions.push(Action::SaveContact {
+            id: id.to_owned(),
+            first,
+            last,
+        });
+    }
+    app.contact_edit = editing;
+    app.group_name_edit = renaming;
+    if let Some(action) = group_action {
+        app.actions.push(action);
+    }
+    ui.add_space(4.0);
+    actions(app, ui, shown, mine, editable);
+    ui.vertical_centered(|ui| super::blocking::button(app, ui, id, Stop::InfoControl(BLOCK_STOP)));
+    let describing = app.group_description_edit.take().filter(|_| group_editable);
+    if let Some(mut draft) = describing {
+        ui.add_space(8.0);
+        match group_description_field(app, ui, &mut draft) {
+            Some(true) => app.actions.push(Action::SetGroupDescription {
+                chat: id.to_owned(),
+                description: draft,
+            }),
+            Some(false) => app.actions.push(Action::CloseGroupDescription),
+            None => app.group_description_edit = Some(draft),
+        }
+    } else if group_editable && shown.description.is_none() {
+        ui.add_space(8.0);
+        let add = crate::i18n::gettext(app.locale, "Add group description");
+        if widgets::menu_item(ui, &palette, Some(Icon::Pencil), add.as_ref()) {
+            app.actions
+                .push(Action::EditGroupDescription(String::new()));
+        }
+    } else if let Some(description) = shown.description.as_deref() {
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            theme::text(
+                ui,
+                crate::i18n::gettext(app.locale, "Description"),
+                theme::medium(12.5),
+                palette.secondary,
+            );
+            if group_editable
+                && theme::icon_button(
+                    ui,
+                    Icon::Pencil,
+                    15.0,
+                    palette.secondary,
+                    palette.text,
+                    &crate::i18n::gettext(app.locale, "Edit group description"),
+                )
+                .clicked()
+            {
+                app.actions
+                    .push(Action::EditGroupDescription(description.to_owned()));
+            }
+        });
+        ui.add_space(4.0);
+        // A long description scrolls in place, so the media and the members
+        // stay close under it.
+        crate::ui::bounce::ScrollArea::vertical()
+            .id_salt("group-description")
+            .max_height(120.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                theme::selectable_text(ui, description, theme::regular(13.5), palette.text);
+            });
+    }
+    // A locked chat's media stays in the locked folder: the section is not
+    // there, rather than empty.
+    if app.info_media_allowed() {
+        ui.add_space(8.0);
+        media_row(app, ui, id, overlay);
+    }
+    // Our own details, under either of our ids, share no groups with us.
+    if !shown.group && !shown.channel && !app.our_ids().contains(&id) {
+        let groups = groups_in_common(app, id);
+        if !groups.is_empty() {
+            ui.add_space(8.0);
+            common_groups(app, ui, id, &groups);
+        }
+    }
+    if shown.can_manage {
+        ui.add_space(4.0);
+        let label = crate::i18n::gettext(app.locale, "Group permissions");
+        let response = nav_row(app, ui, Icon::Shield, &label, PERMISSIONS_STOP);
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(permissions_row_id(), response.rect));
+        if response.clicked() {
+            app.actions.push(Action::ShowInfo(InfoView::Permissions));
+        }
+    }
+    if shown.group && shown.members > 0 {
+        ui.add_space(8.0);
+        members(app, ui, shown, window, photo);
+    }
+    if shown.can_leave {
+        ui.add_space(8.0);
+        let leave_label = if shown.channel {
+            crate::i18n::gettext(app.locale, "Leave channel")
+        } else {
+            crate::i18n::gettext(app.locale, "Leave group")
+        };
+        ui.vertical_centered(|ui| {
+            if super::dialogs::danger_button(ui, app, leave_label.as_ref())
+                .tab_stop(Stop::InfoControl(LEAVE_STOP))
+                .clicked()
+            {
+                leave = true;
+            }
+        });
+    }
+    if leave {
+        app.actions
+            .push(Action::ShowDialog(Dialog::ConfirmLeaveGroup(id.to_owned())));
+    }
+}
+
+/// The actions the chat offers, as many per row as fit, centred.
+fn actions(app: &mut App, ui: &mut egui::Ui, shown: &Shown, mine: bool, editable: bool) {
+    let palette = app.palette;
+    let id = shown.id.as_str();
+    let mut buttons: Vec<(Icon, &str, Vec<Action>)> = Vec::new();
+    if !shown.group && !mine {
+        buttons.push((
+            Icon::MessageCircle,
+            "Message",
+            vec![
+                Action::StartChat {
+                    id: id.to_owned(),
+                    name: shown.name.clone(),
+                    // The panel is not a dialog: whatever dialog is up stays.
+                    dismiss_dialog: false,
+                },
+                Action::CloseInfo,
+            ],
+        ));
+    }
+    if editable {
+        let known = app
+            .contacts
+            .get(id)
+            .and_then(|contact| contact.full_name.as_deref())
+            .is_some_and(|full| !full.is_empty());
+        buttons.push((
+            Icon::User,
+            if known { "Rename" } else { "Add to contacts" },
+            vec![Action::EditContact {
+                id: id.to_owned(),
+                name: shown.name.trim_start_matches('~').to_owned(),
+            }],
+        ));
+    }
+    if let Some(phone) = &shown.phone {
+        buttons.push((
+            Icon::Copy,
+            "Copy number",
+            vec![Action::CopyText(format!("+{phone}"))],
+        ));
+    }
+    if shown.has_chat {
+        buttons.push(if shown.muted {
+            (
+                Icon::Bell,
+                "Unmute",
+                vec![Action::SetMuted(id.to_owned(), None)],
+            )
+        } else {
+            (
+                Icon::BellOff,
+                "Mute",
+                vec![Action::SetMuted(id.to_owned(), Some(0))],
+            )
+        });
+        buttons.push((
+            if shown.pinned {
+                Icon::PinOff
+            } else {
+                Icon::Pin
+            },
+            if shown.pinned { "Unpin" } else { "Pin" },
+            vec![Action::SetPinned(id.to_owned(), !shown.pinned)],
+        ));
+        buttons.push((
+            Icon::Archive,
+            if shown.archived {
+                "Unarchive"
+            } else {
+                "Archive"
+            },
+            vec![
+                Action::SetArchived(id.to_owned(), !shown.archived),
+                Action::CloseInfo,
+            ],
+        ));
+    }
+    let spacing = ui.spacing().item_spacing.x;
+    let available = ui.available_width();
+    let mut fired: Option<Vec<Action>> = None;
+    let mut start = 0;
+    while start < buttons.len() {
+        // Fit and center as many buttons as each row allows.
+        let mut end = start;
+        let mut total = 0.0;
+        while end < buttons.len() {
+            let width = theme::soft_button_width(ui, buttons[end].1, true);
+            let grown = if end == start {
+                width
+            } else {
+                total + spacing + width
+            };
+            if end > start && grown > available {
+                break;
+            }
+            total = grown;
+            end += 1;
+        }
+        ui.horizontal(|ui| {
+            ui.add_space((available - total).max(0.0) / 2.0);
+            for (index, (icon, label, actions)) in buttons[start..end].iter().enumerate() {
+                if theme::soft_button(ui, &palette, Some(*icon), label, false)
+                    .tab_stop(Stop::InfoControl(ACTION_STOP + (start + index) as u8))
+                    .clicked()
+                {
+                    fired = Some(actions.clone());
+                }
+            }
+        });
+        start = end;
+    }
+    if let Some(actions) = fired {
+        app.actions.extend(actions);
+    }
+}
+
+/// The group's members, each opening their own panel. They are sorted once
+/// per change of the chat list or the contacts, not every frame.
+fn members(app: &mut App, ui: &mut egui::Ui, shown: &Shown, window: f32, photo: f32) {
+    let palette = app.palette;
+    let id = shown.id.as_str();
+    if app.info_members.as_ref().is_none_or(|(chat, _)| chat != id) {
+        let list = app
+            .chat(id)
+            .map(|chat| app.participant_list(chat))
+            .unwrap_or_default();
+        app.info_members = Some((id.to_owned(), list));
+    }
+    // Taken for the frame rather than cloned: the rows only push actions.
+    let Some((_, members)) = app.info_members.take() else {
+        return;
+    };
+    theme::text(
+        ui,
+        format!("Members ({})", members.len()),
+        theme::medium(12.5),
+        palette.secondary,
+    );
+    ui.add_space(4.0);
+    if shown.can_add {
+        let label = crate::i18n::gettext(app.locale, "Add members");
+        let response = nav_row(app, ui, Icon::UserPlus, &label, ADD_MEMBERS_STOP);
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(add_members_row_id(), response.rect));
+        if response.clicked() {
+            app.actions
+                .push(Action::ShowDialog(Dialog::AddGroupMembers(id.to_owned())));
+        }
+    }
+    if shown.can_share_link {
+        invite_link(app, ui, id, shown.can_manage);
+        ui.add_space(4.0);
+    }
+    let roles = app
+        .chat(id)
+        .map(crate::group_admin::Roles::of)
+        .unwrap_or_default();
+    let ours: Vec<String> = app.our_ids().into_iter().map(str::to_owned).collect();
+    let ours: Vec<&str> = ours.iter().map(String::as_str).collect();
+    let locale = app.locale;
+    let mut chosen: Option<(String, crate::group_admin::MemberChange)> = None;
+    // Limit the visible rows because groups can have thousands of members.
+    let row_height = 30.0;
+    let rows = ((window - photo - 300.0) / row_height)
+        .floor()
+        .clamp(2.0, 8.0);
+    let mut open = None;
+    // `show_rows` reads the spacing from outside its closure.
+    ui.spacing_mut().item_spacing.y = 0.0;
+    crate::ui::bounce::ScrollArea::vertical()
+        .id_salt(("members", id))
+        .max_height(row_height * rows)
+        .auto_shrink([false, true])
+        .show_rows(ui, row_height, members.len(), |ui, range| {
+            for (member, name) in &members[range] {
+                let (rect, response) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), row_height),
+                    egui::Sense::click(),
+                );
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name)
+                });
+                let admin = roles.is_admin(member);
+                let changes = roles.changes(member, &ours);
+                // The menu's button sits at the row's end, over the row.
+                let more = (!changes.is_empty()).then(|| {
+                    let spot = Rect::from_center_size(
+                        pos2(rect.right() - 14.0, rect.center().y),
+                        Vec2::splat(24.0),
+                    );
+                    let more = ui
+                        .interact(spot, ui.id().with(("member-menu", member)), Sense::click())
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    let label =
+                        crate::i18n::gettext(locale, "Options for {name}").replace("{name}", name);
+                    more.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label)
+                    });
+                    #[cfg(any(test, feature = "demo"))]
+                    {
+                        ui.ctx()
+                            .data_mut(|data| data.insert_temp(member_menu_id(member), spot));
+                        if app.open_member_menu.as_deref() == Some(member.as_str()) {
+                            egui::Popup::open_id(ui.ctx(), more.id.with("popup"));
+                        }
+                    }
+                    more
+                });
+                if ui.is_rect_visible(rect) {
+                    if response.hovered() {
+                        ui.painter().rect_filled(rect, 6.0, palette.surface_hover);
+                    }
+                    let picture = app.avatar(member);
+                    let avatar = egui::Rect::from_center_size(
+                        egui::pos2(rect.left() + 16.0, rect.center().y),
+                        egui::Vec2::splat(24.0),
+                    );
+                    widgets::paint_avatar(
+                        ui,
+                        &palette,
+                        avatar,
+                        name.trim_start_matches('~'),
+                        member,
+                        picture.as_deref(),
+                    );
+                    // The end of the row: the admin tag and the menu button.
+                    let mut end = rect.right() - 4.0;
+                    if let Some(more) = &more {
+                        let color = if more.hovered() {
+                            palette.text
+                        } else {
+                            palette.secondary
+                        };
+                        if more.hovered() {
+                            ui.painter().circle_filled(
+                                more.rect.center(),
+                                12.0,
+                                palette.surface_active,
+                            );
+                        }
+                        theme::paint_icon(ui, Icon::Ellipsis, more.rect, 16.0, color);
+                        end = more.rect.left() - 4.0;
+                    }
+                    if admin {
+                        let tag = widgets::line(
+                            ui,
+                            &crate::i18n::gettext(locale, "Group admin"),
+                            theme::regular(11.5),
+                            palette.accent,
+                            90.0,
+                            1,
+                        );
+                        let pill = Rect::from_min_size(
+                            pos2(
+                                end - tag.size().x - 12.0,
+                                rect.center().y - tag.size().y / 2.0 - 2.0,
+                            ),
+                            tag.size() + vec2(12.0, 4.0),
+                        );
+                        ui.painter()
+                            .rect_filled(pill, 6.0, palette.accent.gamma_multiply(0.14));
+                        tag.paint(ui, pill.min + vec2(6.0, 2.0), palette.accent);
+                        end = pill.left() - 6.0;
+                    }
+                    let line = widgets::line(
+                        ui,
+                        name,
+                        theme::regular(13.0),
+                        palette.text,
+                        (end - rect.left() - 34.0).max(20.0),
+                        1,
+                    );
+                    line.paint(
+                        ui,
+                        egui::pos2(rect.left() + 34.0, rect.center().y - line.size().y / 2.0),
+                        palette.text,
+                    );
+                }
+                // The menu opens from its button or a right-click on the row.
+                if let Some(more) = &more {
+                    let width = member_menu_width(ui, locale, &changes);
+                    for popup in [
+                        egui::Popup::menu(more),
+                        egui::Popup::context_menu(&response),
+                    ] {
+                        popup
+                            .width(width)
+                            .frame(widgets::menu_frame(&palette))
+                            .show(|ui| {
+                                if let Some(change) = member_menu(ui, &palette, locale, &changes) {
+                                    chosen = Some((member.clone(), change));
+                                    ui.close();
+                                }
+                            });
+                    }
+                }
+                if response
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    open = Some(member.clone());
+                }
+            }
+        });
+    app.info_members = Some((id.to_owned(), members));
+    if let Some((member, change)) = chosen {
+        app.actions.push(match change {
+            crate::group_admin::MemberChange::Remove => {
+                Action::ShowDialog(Dialog::ConfirmRemoveMember {
+                    chat: id.to_owned(),
+                    member,
+                })
+            }
+            change => Action::ChangeGroupMember {
+                chat: id.to_owned(),
+                member,
+                change,
+            },
+        });
+    }
+    if let Some(member) = open
+        && Some(member.as_str()) != app.me.as_deref()
+    {
+        app.actions.push(Action::OpenInfo(member));
+    }
+}
+
+/// The groups `person` shares with us, by name, as `(id, name)`: those whose
+/// member list includes them and us. Groups we left are not shared any more,
+/// and a locked group stays in the locked folder rather than showing here.
+fn groups_in_common(app: &App, person: &str) -> Vec<(String, String)> {
+    let ours = app.our_ids();
+    let mut groups: Vec<(String, String)> = app
+        .chats
+        .iter()
+        .filter(|chat| chat.is_group() && !chat.left && !chat.locked)
+        // A member list without us is a group we are out of, however we got
+        // out of it.
+        .filter(|chat| {
+            let has = |id: &str| chat.participants.iter().any(|member| member == id);
+            has(person) && ours.iter().copied().any(has)
+        })
+        .map(|chat| (chat.id.clone(), app.chat_title(chat)))
+        .collect();
+    groups.sort_by_key(|(_, name)| name.to_lowercase());
+    groups
+}
+
+/// The groups in common with `person`, each opening its chat.
+fn common_groups(app: &mut App, ui: &mut egui::Ui, person: &str, groups: &[(String, String)]) {
+    let palette = app.palette;
+    theme::text(
+        ui,
+        crate::i18n::ngettext(
+            app.locale,
+            "{} group in common",
+            "{} groups in common",
+            groups.len() as u32,
+        )
+        .replace("{}", &groups.len().to_string()),
+        theme::medium(12.5),
+        palette.secondary,
+    );
+    ui.add_space(4.0);
+    let row_height = 30.0;
+    let mut open = None;
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        // Every row is laid out, not only the visible ones, so Tab reaches
+        // each group and the list scrolls to the one with the focus.
+        let mut focused = false;
+        let list = crate::ui::bounce::ScrollArea::vertical()
+            .id_salt(("groups-in-common", person))
+            .max_height(row_height * 6.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (index, (group, name)) in groups.iter().enumerate() {
+                    // The id comes from the group alone, not its place in the
+                    // list, so focus stays with the group when the list reorders.
+                    let size = egui::vec2(ui.available_width(), row_height);
+                    let (_, rect) = ui.allocate_space(size);
+                    let id = ui.make_persistent_id(group);
+                    let response = ui.interact(rect, id, egui::Sense::click());
+                    let slot = u8::try_from(index).unwrap_or(u8::MAX);
+                    let stop = Stop::InfoControl(GROUPS_STOP.saturating_add(slot));
+                    let response = response.tab_stop(stop);
+                    focused |= response.gained_focus();
+                    theme::reveal_focus(&response);
+                    theme::focus_outline(ui, response.id, rect, 6.0);
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name)
+                    });
+                    if ui.is_rect_visible(rect) {
+                        if response.hovered() {
+                            ui.painter().rect_filled(rect, 6.0, palette.surface_hover);
+                        }
+                        let picture = app.avatar(group);
+                        let avatar = egui::Rect::from_center_size(
+                            egui::pos2(rect.left() + 16.0, rect.center().y),
+                            egui::Vec2::splat(24.0),
+                        );
+                        widgets::paint_avatar(
+                            ui,
+                            &palette,
+                            avatar,
+                            name,
+                            group,
+                            picture.as_deref(),
+                        );
+                        let line = widgets::line(
+                            ui,
+                            name,
+                            theme::regular(13.0),
+                            palette.text,
+                            (rect.width() - 38.0).max(20.0),
+                            1,
+                        );
+                        line.paint(
+                            ui,
+                            egui::pos2(rect.left() + 34.0, rect.center().y - line.size().y / 2.0),
+                            palette.text,
+                        );
+                    }
+                    if response
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        open = Some(group.clone());
+                    }
+                }
+            });
+        // The list's own scrolling stops at its edge, so the panel brings the
+        // list into view too when Tab lands on a row below its fold.
+        if focused {
+            ui.scroll_to_rect(list.inner_rect, None);
+        }
+    });
+    if let Some(group) = open {
+        app.actions
+            .extend([Action::OpenChat(group), Action::CloseInfo]);
+    }
+}
+
+/// The "Media, links and docs" row: its count once the listing is in, a
+/// chevron, and the newest pictures under it. The row opens the media view;
+/// a picture goes to its message.
+fn media_row(app: &mut App, ui: &mut egui::Ui, chat: &str, overlay: bool) {
+    let palette = app.palette;
+    // Taken for the frame rather than cloned: the cells only push actions.
+    let listing = app.info_media.take();
+    let uris = std::mem::take(&mut app.info_uris);
+    let shown = listing.as_ref().filter(|media| media.chat == chat);
+    let count = shown.map(|media| {
+        (
+            media.media.len() + media.docs.len() + media.links.len(),
+            media.truncated(),
+        )
+    });
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
+    let response = response.tab_stop(Stop::InfoControl(MEDIA_ROW_STOP));
+    if app.info_focus == Some(InfoFocus::MediaRow) {
+        app.info_focus = None;
+        response.request_focus();
+    }
+    theme::reveal_focus(&response);
+    theme::focus_outline(ui, response.id, rect, 6.0);
+    let title = media_title(app);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &title));
+    if ui.is_rect_visible(rect) {
+        if response.hovered() {
+            // The label sits on the panel's margin, in line with the members
+            // header and the pictures under it; the highlight reaches past.
+            ui.painter()
+                .rect_filled(rect.expand2(vec2(6.0, 0.0)), 6.0, palette.surface_hover);
+        }
+        ui.painter().text(
+            pos2(rect.left(), rect.center().y),
+            Align2::LEFT_CENTER,
+            &title,
+            theme::regular(13.5),
+            palette.secondary,
+        );
+        let chevron = Rect::from_center_size(
+            pos2(rect.right() - 15.0, rect.center().y),
+            Vec2::splat(18.0),
+        );
+        theme::paint_icon(ui, Icon::ChevronRight, chevron, 18.0, palette.dim);
+        if let Some((count, cut)) = count {
+            // A "+" says the lists were cut, so the count is a floor.
+            let count = if cut {
+                crate::i18n::gettext(app.locale, "{}+").replace("{}", &count.to_string())
+            } else {
+                count.to_string()
+            };
+            ui.painter().text(
+                pos2(chevron.left() - 2.0, rect.center().y),
+                Align2::RIGHT_CENTER,
+                count,
+                theme::regular(13.0),
+                palette.dim,
+            );
+        }
+    }
+    if response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+    {
+        app.actions
+            .push(Action::ShowInfo(InfoView::Media(MediaTab::Media)));
+    }
+    if app.info_media_failed {
+        failure_line(app, ui);
+    }
+    if let Some(media) = shown
+        && !media.media.is_empty()
+    {
+        let cell = ((ui.available_width() - 2.0 * GAP) / 3.0).min(110.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = GAP;
+            for (index, message) in media.media.iter().take(3).enumerate() {
+                let (rect, response) = ui.allocate_exact_size(Vec2::splat(cell), Sense::click());
+                media_cell(
+                    app,
+                    ui,
+                    rect,
+                    response,
+                    message,
+                    uris.get(index).map(String::as_str),
+                    overlay,
+                );
+            }
+        });
+    }
+    app.info_uris = uris;
+    app.info_media = listing;
+}
+
+/// Says the listing could not be made, with a button that asks again.
+fn failure_line(app: &mut App, ui: &mut egui::Ui) {
+    let palette = app.palette;
+    ui.horizontal_wrapped(|ui| {
+        theme::text(
+            ui,
+            crate::i18n::gettext(app.locale, "Could not list the media."),
+            theme::regular(12.5),
+            palette.dim,
+        );
+        if theme::soft_button(
+            ui,
+            &palette,
+            Some(Icon::Refresh),
+            &crate::i18n::gettext(app.locale, "Try again"),
+            false,
+        )
+        .tab_stop(Stop::InfoControl(RETRY_STOP))
+        .clicked()
+        {
+            app.actions.push(Action::RetryInfoMedia);
+        }
+    });
+}
+
+/// The media view: a back header, the three tabs, and the tab's list.
+fn media_view(app: &mut App, ui: &mut egui::Ui, chat: &str, tab: MediaTab, overlay: bool) {
+    let palette = app.palette;
+    let back = crate::i18n::gettext(app.locale, "Back");
+    let title = media_title(app);
+    let focus_back = app.info_focus == Some(InfoFocus::Back);
+    if focus_back {
+        app.info_focus = None;
+    }
+    header(
+        app,
+        ui,
+        Icon::ChevronLeft,
+        &back,
+        &title,
+        Action::ShowInfo(InfoView::Overview),
+        focus_back,
+    );
+    // Taken for the frame rather than cloned: the rows only push actions.
+    let listing = app.info_media.take();
+    let uris = std::mem::take(&mut app.info_uris);
+    let shown = listing.as_ref().filter(|media| media.chat == chat);
+    Frame::new()
+        .inner_margin(Margin::symmetric(MARGIN as i8, 10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for (index, choice) in [MediaTab::Media, MediaTab::Docs, MediaTab::Links]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let count = shown.map_or(0, |media| match choice {
+                        MediaTab::Media => media.media.len(),
+                        MediaTab::Docs => media.docs.len(),
+                        MediaTab::Links => media.links.len(),
+                    });
+                    let label = tab_label(app, choice);
+                    if widgets::filter_chip(ui, &palette, &label, count, choice == tab)
+                        .tab_stop(Stop::InfoControl(TAB_STOP + index as u8))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        app.actions.push(Action::ShowInfo(InfoView::Media(choice)));
+                    }
+                }
+            });
+        });
+    ui.painter().hline(
+        ui.max_rect().x_range(),
+        ui.cursor().top(),
+        Stroke::new(1.0, palette.outline),
+    );
+    match shown {
+        Some(media) => {
+            let cut = match tab {
+                MediaTab::Media => media.media_truncated,
+                MediaTab::Docs => media.docs_truncated,
+                MediaTab::Links => media.links_truncated,
+            };
+            if cut {
+                truncated_note(app, ui);
+            }
+            match tab {
+                MediaTab::Media => media_grid(app, ui, media, &uris, overlay),
+                MediaTab::Docs => docs_list(app, ui, media, overlay),
+                MediaTab::Links => links_list(app, ui, media),
+            }
+        }
+        None if app.info_media_failed => {
+            ui.add_space(24.0);
+            ui.horizontal(|ui| {
+                ui.add_space(MARGIN);
+                failure_line(app, ui);
+            });
+        }
+        None if app.info_media_pending => {
+            ui.add_space(32.0);
+            ui.vertical_centered(|ui| theme::spinner(ui, 22.0, palette.secondary));
+        }
+        None => {}
+    }
+    app.info_uris = uris;
+    app.info_media = listing;
+}
+
+/// The chat's pictures and videos, newest first, in square cells as wide as
+/// the panel allows. Only the rows on screen are laid out, so only their
+/// thumbnails are decoded.
+fn media_grid(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    listing: &ChatMedia,
+    uris: &[String],
+    overlay: bool,
+) {
+    let palette = app.palette;
+    if listing.media.is_empty() {
+        widgets::empty_state(
+            ui,
+            &palette,
+            Icon::Image,
+            &crate::i18n::gettext(app.locale, "No media"),
+            &crate::i18n::gettext(
+                app.locale,
+                "Photos and videos shared in this chat will show here.",
+            ),
+        );
+        return;
+    }
+    let width = ui.available_width() - 2.0 * MARGIN;
+    let columns = if width >= 4.0 * 84.0 + 3.0 * GAP {
+        4
+    } else {
+        3
+    };
+    let cell = (width - (columns - 1) as f32 * GAP) / columns as f32;
+    let rows = listing.media.len().div_ceil(columns);
+    ui.add_space(6.0);
+    // `show_rows` reads the spacing from outside its closure.
+    ui.spacing_mut().item_spacing = vec2(GAP, GAP);
+    crate::ui::bounce::ScrollArea::vertical()
+        .id_salt(("info-media-grid", listing.chat.as_str()))
+        .auto_shrink([false, false])
+        .show_rows(ui, cell + GAP, rows, |ui, range| {
+            for row in range {
+                ui.horizontal(|ui| {
+                    ui.add_space(MARGIN);
+                    for column in 0..columns {
+                        let index = row * columns + column;
+                        let Some(message) = listing.media.get(index) else {
+                            break;
+                        };
+                        let (rect, response) =
+                            ui.allocate_exact_size(Vec2::splat(cell), Sense::click());
+                        media_cell(
+                            app,
+                            ui,
+                            rect,
+                            response,
+                            message,
+                            uris.get(index).map(String::as_str),
+                            overlay,
+                        );
+                    }
+                });
+            }
+        });
+}
+
+/// One square picture or video: its preview cropped to the square, with a
+/// play mark and the length on a video. Clicking it goes to the message.
+fn media_cell(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    rect: Rect,
+    response: egui::Response,
+    message: &Message,
+    uri: Option<&str>,
+    overlay: bool,
+) {
+    let palette = app.palette;
+    let video = matches!(message.content, Content::Video { .. });
+    let seconds = match &message.content {
+        Content::Video { seconds, .. } => *seconds,
+        _ => None,
+    };
+    let stamp = crate::util::chat_stamp(app.locale, message.timestamp);
+    response.widget_info(|| {
+        let what = if video {
+            crate::i18n::gettext(app.locale, "Video")
+        } else {
+            crate::i18n::gettext(app.locale, "Photo")
+        };
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{what}, {stamp}"))
+    });
+    if ui.is_rect_visible(rect) {
+        if !thumbnail(ui, &palette, rect, message, uri) {
+            ui.painter().rect_filled(rect, 6.0, palette.surface);
+            let icon = if video { Icon::Video } else { Icon::Image };
+            theme::paint_icon(ui, icon, rect, 22.0, palette.dim);
+        }
+        if video {
+            let disc = Rect::from_center_size(rect.center(), Vec2::splat(30.0));
+            ui.painter()
+                .circle_filled(disc.center(), 15.0, Color32::from_black_alpha(140));
+            theme::paint_icon(ui, Icon::Play, disc, 14.0, Color32::WHITE);
+            if let Some(seconds) = seconds {
+                let galley = ui.painter().layout_no_wrap(
+                    crate::util::duration(seconds),
+                    theme::medium(11.0),
+                    Color32::WHITE,
+                );
+                let pad = vec2(4.0, 2.0);
+                let label = Rect::from_min_max(
+                    rect.max - galley.size() - pad * 2.0 - Vec2::splat(4.0),
+                    rect.max - Vec2::splat(4.0),
+                );
+                ui.painter()
+                    .rect_filled(label, 3.0, Color32::from_black_alpha(140));
+                ui.painter().galley(label.min + pad, galley, Color32::WHITE);
+            }
+        }
+        if response.hovered() {
+            ui.painter()
+                .rect_filled(rect, 6.0, Color32::from_white_alpha(24));
+        }
+    }
+    if response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+    {
+        go_to(app, message, overlay);
+    }
+}
+
+/// Goes to a listed message. Over a narrow chat the panel would hide it,
+/// so the panel closes, as the search pane folds.
+fn go_to(app: &mut App, message: &Message, overlay: bool) {
+    app.actions.push(Action::OpenMessage {
+        chat: message.chat.clone(),
+        message: message.id.clone(),
+    });
+    if overlay {
+        app.actions.push(Action::CloseInfo);
+    }
+}
+
+/// Paints the message's preview cropped to fill `rect`, and reports whether
+/// there was one. The archived JPEG preview needs no download; a downloaded
+/// picture without one goes through egui's file loader, as in the bubble. A
+/// video without one keeps its placeholder: its file is not a picture.
+fn thumbnail(
+    ui: &egui::Ui,
+    palette: &theme::Palette,
+    rect: Rect,
+    message: &Message,
+    uri: Option<&str>,
+) -> bool {
+    let image = match (&message.thumbnail, uri, &message.content) {
+        (Some(bytes), Some(uri), _) => {
+            crate::image_cache::include(ui.ctx(), uri, bytes);
+            egui::Image::new(uri.to_owned())
+        }
+        (_, _, Content::Image { media, .. }) if media.path.is_some() => {
+            let path = media.path.as_deref().expect("checked");
+            widgets::file_image(ui, path)
+        }
+        _ => return false,
+    };
+    // The texture's shape is known once it is decoded; until then the cell
+    // is a plain surface rather than a stretched placeholder.
+    let Ok(egui::load::TexturePoll::Ready { texture }) = image.load_for_size(ui.ctx(), rect.size())
+    else {
+        ui.painter().rect_filled(rect, 6.0, palette.surface);
+        return true;
+    };
+    // Cover the square: the longer side is cropped at both ends.
+    let (width, height) = (texture.size.x.max(1.0), texture.size.y.max(1.0));
+    let uv = if width > height {
+        let cut = (1.0 - height / width) / 2.0;
+        Rect::from_min_max(pos2(cut, 0.0), pos2(1.0 - cut, 1.0))
+    } else {
+        let cut = (1.0 - width / height) / 2.0;
+        Rect::from_min_max(pos2(0.0, cut), pos2(1.0, 1.0 - cut))
+    };
+    image.uv(uv).corner_radius(6.0).paint_at(ui, rect);
+    true
+}
+
+/// The chat's documents, newest first: a file icon, the name, and its
+/// pages, size and day. A row goes to its message.
+fn docs_list(app: &mut App, ui: &mut egui::Ui, listing: &ChatMedia, overlay: bool) {
+    let palette = app.palette;
+    if listing.docs.is_empty() {
+        widgets::empty_state(
+            ui,
+            &palette,
+            Icon::FileText,
+            &crate::i18n::gettext(app.locale, "No documents"),
+            &crate::i18n::gettext(app.locale, "Files shared in this chat will show here."),
+        );
+        return;
+    }
+    // `show_rows` reads the spacing from outside its closure.
+    ui.spacing_mut().item_spacing.y = 0.0;
+    crate::ui::bounce::ScrollArea::vertical()
+        .id_salt(("info-docs", listing.chat.as_str()))
+        .auto_shrink([false, false])
+        .show_rows(ui, ROW_HEIGHT, listing.docs.len(), |ui, range| {
+            for message in &listing.docs[range] {
+                let Content::Document {
+                    media,
+                    file_name,
+                    pages,
+                    ..
+                } = &message.content
+                else {
+                    continue;
+                };
+                let mut detail = Vec::new();
+                if let Some(pages) = pages {
+                    detail.push(
+                        crate::i18n::ngettext(app.locale, "{} page", "{} pages", *pages)
+                            .replace("{}", &pages.to_string()),
+                    );
+                }
+                detail.push(crate::util::bytes(media.size));
+                detail.push(crate::util::chat_stamp(app.locale, message.timestamp));
+                if item_row(app, ui, Icon::FileText, file_name, &detail.join(" · ")).clicked() {
+                    go_to(app, message, overlay);
+                }
+            }
+        });
+}
+
+/// The web links written in the chat, newest first: the preview's title or
+/// the address, and the site. A row opens the address in the browser.
+fn links_list(app: &mut App, ui: &mut egui::Ui, listing: &ChatMedia) {
+    let palette = app.palette;
+    if listing.links.is_empty() {
+        widgets::empty_state(
+            ui,
+            &palette,
+            Icon::ExternalLink,
+            &crate::i18n::gettext(app.locale, "No links"),
+            &crate::i18n::gettext(app.locale, "Links shared in this chat will show here."),
+        );
+        return;
+    }
+    // `show_rows` reads the spacing from outside its closure.
+    ui.spacing_mut().item_spacing.y = 0.0;
+    crate::ui::bounce::ScrollArea::vertical()
+        .id_salt(("info-links", listing.chat.as_str()))
+        .auto_shrink([false, false])
+        .show_rows(ui, ROW_HEIGHT, listing.links.len(), |ui, range| {
+            for link in &listing.links[range] {
+                let title = link.title.as_deref().unwrap_or(&link.url);
+                let detail = format!(
+                    "{} · {}",
+                    domain(&link.url),
+                    crate::util::chat_stamp(app.locale, link.timestamp)
+                );
+                if item_row(app, ui, Icon::ExternalLink, title, &detail).clicked() {
+                    app.actions.push(Action::OpenUrl(link.url.clone()));
+                }
+            }
+        });
+}
+
+/// One document or link row: an icon in a tile, a title, and a detail line.
+/// A pointer and accessibility target, like a chat row, not a Tab stop.
+fn item_row(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    icon: Icon,
+    title: &str,
+    detail: &str,
+) -> egui::Response {
+    let palette = app.palette;
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{title}, {detail}"))
+    });
+    if ui.is_rect_visible(rect) {
+        if response.hovered() {
+            ui.painter().rect_filled(rect, 0.0, palette.surface_hover);
+        }
+        let tile = Rect::from_center_size(
+            pos2(rect.left() + MARGIN + 20.0, rect.center().y),
+            Vec2::splat(40.0),
+        );
+        ui.painter().rect_filled(tile, 8.0, palette.surface);
+        theme::paint_icon(ui, icon, tile, 20.0, palette.secondary);
+        let left = tile.right() + 12.0;
+        let width = rect.right() - MARGIN - left;
+        let name = widgets::line(ui, title, theme::medium(13.5), palette.text, width, 1);
+        name.paint(ui, pos2(left, rect.top() + 12.0), palette.text);
+        let line = widgets::line(ui, detail, theme::regular(12.0), palette.dim, width, 1);
+        line.paint(ui, pos2(left, rect.top() + 33.0), palette.dim);
+        ui.painter().hline(
+            left..=rect.right() - MARGIN,
+            rect.bottom() - 0.5,
+            Stroke::new(1.0, palette.outline),
+        );
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Says the open tab's list was cut, above it, when the archive held more
+/// than it carries.
+fn truncated_note(app: &App, ui: &mut egui::Ui) {
+    let palette = app.palette;
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.add_space(MARGIN);
+        let line = widgets::line(
+            ui,
+            &crate::i18n::gettext(app.locale, "Only the newest items are listed."),
+            theme::regular(12.0),
+            palette.dim,
+            ui.available_width() - MARGIN,
+            2,
+        );
+        let (rect, _) = ui.allocate_exact_size(line.size(), Sense::hover());
+        line.paint(ui, rect.min, palette.dim);
+    });
+    ui.add_space(4.0);
+}
+
+/// A tab's label. The words are short, so each carries the context that
+/// tells a translator where it sits.
+pub fn tab_label(app: &App, tab: MediaTab) -> String {
+    match tab {
+        MediaTab::Media => crate::i18n::pgettext(app.locale, "info tab", "Media"),
+        MediaTab::Docs => crate::i18n::pgettext(app.locale, "info tab", "Docs"),
+        MediaTab::Links => crate::i18n::pgettext(app.locale, "info tab", "Links"),
+    }
+    .into_owned()
+}
+
+/// The host an address opens, without a leading `www.`. It is parsed, not
+/// sliced, so userinfo such as `bank.example@` cannot pose as the site.
+pub fn domain(url: &str) -> String {
+    let parsed = reqwest::Url::parse(url)
+        .or_else(|_| reqwest::Url::parse(&format!("https://{url}")))
+        .ok();
+    match parsed.as_ref().and_then(reqwest::Url::host_str) {
+        Some(host) => host.trim_start_matches("www.").to_owned(),
+        None => url.to_owned(),
+    }
+}
+
+/// A row that leads somewhere: an icon in a round tile, a label, and a
+/// chevron, as the panel's "Group permissions" and "Add members".
+fn nav_row(app: &mut App, ui: &mut egui::Ui, icon: Icon, label: &str, stop: u8) -> egui::Response {
+    let palette = app.palette;
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
+    let response = response.tab_stop(Stop::InfoControl(stop));
+    theme::reveal_focus(&response);
+    theme::focus_outline(ui, response.id, rect, 6.0);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    if ui.is_rect_visible(rect) {
+        if response.hovered() {
+            ui.painter()
+                .rect_filled(rect.expand2(vec2(6.0, 0.0)), 6.0, palette.surface_hover);
+        }
+        let tile =
+            Rect::from_center_size(pos2(rect.left() + 16.0, rect.center().y), Vec2::splat(32.0));
+        ui.painter()
+            .circle_filled(tile.center(), 16.0, palette.accent.gamma_multiply(0.16));
+        theme::paint_icon(ui, icon, tile, 17.0, palette.accent);
+        let line = widgets::line(
+            ui,
+            label,
+            theme::medium(13.5),
+            palette.text,
+            rect.width() - 70.0,
+            1,
+        );
+        line.paint(
+            ui,
+            pos2(tile.right() + 10.0, rect.center().y - line.size().y / 2.0),
+            palette.text,
+        );
+        let chevron = Rect::from_center_size(
+            pos2(rect.right() - 15.0, rect.center().y),
+            Vec2::splat(18.0),
+        );
+        theme::paint_icon(ui, Icon::ChevronRight, chevron, 18.0, palette.dim);
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The group's invite link: the address, Copy link, and for admins Reset
+/// link. It is asked for the first time the row is drawn.
+fn invite_link(app: &mut App, ui: &mut egui::Ui, id: &str, can_reset: bool) {
+    use crate::group_admin::LinkState;
+    let palette = app.palette;
+    let locale = app.locale;
+    let state = app
+        .info_invite
+        .as_ref()
+        .filter(|(chat, _)| chat == id)
+        .map(|(_, state)| state.clone());
+    if state.is_none() {
+        app.actions.push(Action::FetchInviteLink(id.to_owned()));
+    }
+    let state = state.unwrap_or(LinkState::Loading);
+    let response = ui.horizontal(|ui| {
+        let (tile, _) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::hover());
+        ui.painter()
+            .circle_filled(tile.center(), 16.0, palette.accent.gamma_multiply(0.16));
+        theme::paint_icon(ui, Icon::Link, tile, 17.0, palette.accent);
+        ui.add_space(2.0);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            theme::text(
+                ui,
+                crate::i18n::gettext(locale, "Invite via link"),
+                theme::medium(13.5),
+                palette.text,
+            );
+            match &state {
+                LinkState::Loading => {
+                    ui.horizontal(|ui| {
+                        theme::spinner(ui, 12.0, palette.secondary);
+                        theme::text(
+                            ui,
+                            crate::i18n::gettext(locale, "Getting the link…"),
+                            theme::regular(12.5),
+                            palette.dim,
+                        );
+                    });
+                }
+                LinkState::Known(link) => {
+                    theme::selectable_text(
+                        ui,
+                        link.as_str(),
+                        theme::regular(12.5),
+                        palette.secondary,
+                    );
+                }
+                LinkState::Failed(failure) => {
+                    theme::paragraph(
+                        ui,
+                        failure.link_message(locale),
+                        theme::regular(12.5),
+                        palette.dim,
+                    );
+                }
+            }
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                match &state {
+                    LinkState::Failed(_) => {
+                        let retry = crate::i18n::gettext(locale, "Try again");
+                        if theme::soft_button(ui, &palette, Some(Icon::Refresh), &retry, false)
+                            .tab_stop(Stop::InfoControl(COPY_LINK_STOP))
+                            .clicked()
+                        {
+                            app.actions.push(Action::FetchInviteLink(id.to_owned()));
+                        }
+                    }
+                    _ => {
+                        let known = matches!(state, LinkState::Known(_));
+                        let copy = crate::i18n::gettext(locale, "Copy link");
+                        let copied = ui
+                            .add_enabled_ui(known, |ui| {
+                                theme::soft_button(ui, &palette, Some(Icon::Copy), &copy, false)
+                                    .tab_stop(Stop::InfoControl(COPY_LINK_STOP))
+                            })
+                            .inner;
+                        ui.ctx()
+                            .data_mut(|data| data.insert_temp(copy_link_id(), copied.rect));
+                        if copied.clicked() {
+                            app.actions.push(Action::CopyInviteLink(id.to_owned()));
+                        }
+                    }
+                }
+                if can_reset {
+                    let reset = crate::i18n::gettext(locale, "Reset link");
+                    let loading = matches!(state, LinkState::Loading);
+                    let button = ui
+                        .add_enabled_ui(!loading, |ui| {
+                            theme::soft_button(ui, &palette, Some(Icon::RotateLeft), &reset, false)
+                                .tab_stop(Stop::InfoControl(RESET_LINK_STOP))
+                        })
+                        .inner;
+                    ui.ctx()
+                        .data_mut(|data| data.insert_temp(reset_link_id(), button.rect));
+                    if button.clicked() {
+                        app.actions
+                            .push(Action::ShowDialog(Dialog::ConfirmResetInviteLink(
+                                id.to_owned(),
+                            )));
+                    }
+                }
+            });
+        });
+    });
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(invite_link_id(), response.response.rect));
+}
+
+/// The member menu's items for `changes`, returning the one picked.
+fn member_menu(
+    ui: &mut egui::Ui,
+    palette: &theme::Palette,
+    locale: crate::i18n::Locale,
+    changes: &[crate::group_admin::MemberChange],
+) -> Option<crate::group_admin::MemberChange> {
+    let mut picked = None;
+    for change in changes {
+        let (icon, label) = member_menu_item(locale, *change);
+        if widgets::menu_item(ui, palette, Some(icon), &label) {
+            picked = Some(*change);
+        }
+    }
+    picked
+}
+
+fn member_menu_item(
+    locale: crate::i18n::Locale,
+    change: crate::group_admin::MemberChange,
+) -> (Icon, String) {
+    use crate::group_admin::MemberChange;
+    match change {
+        MemberChange::Promote => (
+            Icon::Shield,
+            crate::i18n::gettext(locale, "Make group admin").into_owned(),
+        ),
+        MemberChange::Demote => (
+            Icon::ShieldOff,
+            crate::i18n::gettext(locale, "Dismiss as admin").into_owned(),
+        ),
+        MemberChange::Remove => (
+            Icon::UserMinus,
+            crate::i18n::gettext(locale, "Remove from group").into_owned(),
+        ),
+    }
+}
+
+fn member_menu_width(
+    ui: &egui::Ui,
+    locale: crate::i18n::Locale,
+    changes: &[crate::group_admin::MemberChange],
+) -> f32 {
+    let labels: Vec<String> = changes
+        .iter()
+        .map(|change| member_menu_item(locale, *change).1)
+        .collect();
+    let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+    widgets::menu_width(ui, &labels, true)
+}
+
+/// The group's permissions, for its admins: what members may do, as
+/// WhatsApp's own "Group permissions" lists it. A switch moves once
+/// WhatsApp accepts the change.
+fn permissions_view(app: &mut App, ui: &mut egui::Ui, chat: &str) {
+    use crate::group_admin::Permission;
+    let palette = app.palette;
+    let locale = app.locale;
+    let back = crate::i18n::gettext(locale, "Back");
+    let title = crate::i18n::gettext(locale, "Group permissions");
+    let focus_back = app.info_focus == Some(InfoFocus::Back);
+    if focus_back {
+        app.info_focus = None;
+    }
+    header(
+        app,
+        ui,
+        Icon::ChevronLeft,
+        &back,
+        &title,
+        Action::ShowInfo(InfoView::Overview),
+        focus_back,
+    );
+    let values: Vec<(Permission, Option<bool>)> = app
+        .chat(chat)
+        .map(|row| {
+            Permission::ALL
+                .iter()
+                .map(|permission| (*permission, permission.value(row)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let saving = app.group_saving.contains(chat);
+    let mut changed = None;
+    crate::ui::bounce::ScrollArea::vertical()
+        .id_salt(("group-permissions", chat))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            Frame::new()
+                .inner_margin(Margin::symmetric(MARGIN as i8, 12))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    for (index, (permission, value)) in values.iter().enumerate() {
+                        if index == 0 || *permission == Permission::ApproveMembers {
+                            if index > 0 {
+                                ui.add_space(8.0);
+                            }
+                            let heading = if *permission == Permission::ApproveMembers {
+                                crate::i18n::gettext(locale, "Admins can:")
+                            } else {
+                                crate::i18n::gettext(locale, "Members can:")
+                            };
+                            theme::text(ui, heading, theme::medium(12.5), palette.secondary);
+                        }
+                        let stop = TAB_STOP + index as u8;
+                        if let Some(members) =
+                            permission_row(app, ui, *permission, *value, !saving, stop)
+                        {
+                            changed = Some((*permission, members));
+                        }
+                    }
+                    if saving {
+                        theme::text(
+                            ui,
+                            crate::i18n::gettext(locale, "Saving…"),
+                            theme::regular(12.5),
+                            palette.dim,
+                        );
+                    }
+                });
+        });
+    if let Some((permission, members)) = changed {
+        app.actions.push(Action::SetGroupPermission {
+            chat: chat.to_owned(),
+            permission,
+            members,
+        });
+    }
+}
+
+/// One permission: its label and line, and a switch. Returns the value
+/// asked for when the switch is turned.
+fn permission_row(
+    app: &App,
+    ui: &mut egui::Ui,
+    permission: crate::group_admin::Permission,
+    value: Option<bool>,
+    enabled: bool,
+    stop: u8,
+) -> Option<bool> {
+    let palette = app.palette;
+    let label = permission.label(app.locale);
+    let description = permission.description(app.locale);
+    let mut turned = None;
+    let row = ui.horizontal(|ui| {
+        let switch_room = 52.0;
+        ui.vertical(|ui| {
+            ui.set_width((ui.available_width() - switch_room).max(80.0));
+            ui.spacing_mut().item_spacing.y = 2.0;
+            let width = ui.available_width();
+            let title = widgets::line(ui, &label, theme::medium(14.0), palette.text, width, 2);
+            let (spot, _) = ui.allocate_exact_size(title.size(), Sense::hover());
+            title.paint(ui, spot.min, palette.text);
+            let line = widgets::line(
+                ui,
+                &description,
+                theme::regular(12.5),
+                palette.secondary,
+                width,
+                usize::MAX,
+            );
+            let (spot, _) = ui.allocate_exact_size(line.size(), Sense::hover());
+            line.paint(ui, spot.min, palette.secondary);
+        });
+        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+            let mut on = value.unwrap_or(false);
+            let response = ui
+                .add_enabled_ui(enabled && value.is_some(), |ui| {
+                    widgets::switch(ui, &palette, &mut on).tab_stop(Stop::InfoControl(stop))
+                })
+                .inner;
+            theme::reveal_focus(&response);
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), on, &label)
+            });
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(permission_switch_id(permission), response.rect));
+            if response.changed() {
+                turned = Some(on);
+            }
+        });
+    });
+    let _ = row;
+    ui.add_space(4.0);
+    turned
+}
+
+/// Where the "Group permissions" row was drawn, for interaction tests.
+pub fn permissions_row_id() -> egui::Id {
+    egui::Id::new("group-permissions-row")
+}
+
+/// Where the "Add members" row was drawn, for interaction tests.
+pub fn add_members_row_id() -> egui::Id {
+    egui::Id::new("group-add-members-row")
+}
+
+/// Where the invite link block was drawn, for interaction tests.
+pub fn invite_link_id() -> egui::Id {
+    egui::Id::new("group-invite-link")
+}
+
+/// Where Copy link was drawn, for interaction tests.
+pub fn copy_link_id() -> egui::Id {
+    egui::Id::new("group-copy-link")
+}
+
+/// Where Reset link was drawn, for interaction tests.
+pub fn reset_link_id() -> egui::Id {
+    egui::Id::new("group-reset-link")
+}
+
+/// Where a permission's switch was drawn, for interaction tests.
+pub fn permission_switch_id(permission: crate::group_admin::Permission) -> egui::Id {
+    egui::Id::new(("group-permission", permission))
+}
+
+/// Where a member's menu button was drawn, for interaction tests.
+#[cfg(any(test, feature = "demo"))]
+pub fn member_menu_id(member: &str) -> egui::Id {
+    egui::Id::new(("group-member-menu", member))
+}
+
+/// Where the pencil that renames a group was drawn, for interaction tests.
+pub fn group_name_button_id() -> egui::Id {
+    egui::Id::new("group-name-edit")
+}
+
+/// Where the group photo that opens its menu was drawn, for interaction tests.
+pub fn group_photo_id() -> egui::Id {
+    egui::Id::new("group-photo")
+}
+
+/// The group's big photo, which opens a menu to change or remove it.
+fn group_photo(
+    app: &App,
+    ui: &mut egui::Ui,
+    name: &str,
+    id: &str,
+    size: f32,
+    picture: Option<&std::path::Path>,
+) -> Option<Action> {
+    let palette = app.palette;
+    let label = crate::i18n::gettext(app.locale, "Change group photo");
+    let response = widgets::clickable_avatar(ui, &palette, name, id, size, picture, &label)
+        .tab_stop(Stop::InfoControl(PHOTO_STOP))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(label.as_ref());
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(group_photo_id(), response.rect));
+    let change = crate::i18n::gettext(app.locale, "Change photo");
+    let remove = crate::i18n::gettext(app.locale, "Remove photo");
+    let width = widgets::menu_width(ui, &[change.as_ref(), remove.as_ref()], true);
+    let mut chosen = None;
+    egui::Popup::menu(&response)
+        .width(width)
+        .frame(widgets::menu_frame(&palette))
+        .show(|ui| {
+            if widgets::menu_item(ui, &palette, Some(Icon::Image), &change) {
+                chosen = Some(Action::PickGroupPicture(id.to_owned()));
+                ui.close();
+            }
+            // Only a photo that is there can be removed.
+            if picture.is_some() && widgets::menu_item(ui, &palette, Some(Icon::Trash), &remove) {
+                chosen = Some(Action::RemoveGroupPicture(id.to_owned()));
+                ui.close();
+            }
+        });
+    chosen
+}
+
+/// The group name being typed. Returns `Some(true)` when Enter or the check
+/// submits it, `Some(false)` when the cross cancels it.
+/// The description's editor: `Some(true)` to save and `Some(false)` to cancel.
+/// Enter starts a new line, as a description may have several.
+fn group_description_field(app: &App, ui: &mut egui::Ui, draft: &mut String) -> Option<bool> {
+    let palette = app.palette;
+    let hint = crate::i18n::gettext(app.locale, "Group description");
+    let field = Frame::new()
+        .fill(palette.surface)
+        .corner_radius(CornerRadius::same(theme::RADIUS))
+        .inner_margin(Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(draft)
+                    .id(group_description_field_id())
+                    .hint_text(
+                        egui::RichText::new(hint.as_ref())
+                            .color(palette.dim)
+                            .font(theme::regular(13.5)),
+                    )
+                    .font(theme::regular(13.5))
+                    .text_color(palette.text)
+                    .frame(Frame::NONE)
+                    .char_limit(crate::model::GROUP_DESCRIPTION_LIMIT)
+                    .desired_rows(4)
+                    .desired_width(f32::INFINITY),
+            )
+        });
+    theme::focus_outline(
+        ui,
+        field.inner.id,
+        field.response.rect,
+        f32::from(theme::RADIUS),
+    );
+    if ui.memory(|memory| memory.focused().is_none()) {
+        field.inner.request_focus();
+    }
+    let mut outcome = None;
+    ui.horizontal(|ui| {
+        if theme::icon_button(
+            ui,
+            Icon::Check,
+            18.0,
+            palette.secondary,
+            palette.accent,
+            &crate::i18n::gettext(app.locale, "Save description"),
+        )
+        .clicked()
+        {
+            outcome = Some(true);
+        }
+        if theme::icon_button(
+            ui,
+            Icon::X,
+            18.0,
+            palette.secondary,
+            palette.text,
+            &crate::i18n::gettext(app.locale, "Cancel"),
+        )
+        .clicked()
+        {
+            outcome = Some(false);
+        }
+    });
+    outcome
+}
+
+fn group_description_field_id() -> egui::Id {
+    egui::Id::new("group-description-field")
+}
+
+fn group_name_field(app: &App, ui: &mut egui::Ui, draft: &mut String) -> Option<bool> {
+    let palette = app.palette;
+    let mut outcome = None;
+    ui.horizontal(|ui| {
+        let buttons = 2.0 * (18.0 + 12.0) + 2.0 * ui.spacing().item_spacing.x;
+        let width = 240.0_f32.min(ui.available_width() - buttons);
+        ui.add_space(((ui.available_width() - width - buttons) / 2.0).max(0.0));
+        let format = egui::TextFormat::simple(theme::semibold(15.0), palette.text);
+        let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap: f32| {
+            crate::bidi::layout_field(ui, text.as_str(), &format, wrap)
+        };
+        let align = if crate::bidi::base_rtl(draft) {
+            Align::RIGHT
+        } else {
+            Align::LEFT
+        };
+        let hint = crate::i18n::gettext(app.locale, "Group name");
+        let field = Frame::new()
+            .fill(palette.surface)
+            .corner_radius(CornerRadius::same(theme::RADIUS))
+            .inner_margin(Margin::symmetric(10, 5))
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(draft)
+                        .id(group_name_field_id())
+                        .hint_text(
+                            egui::RichText::new(hint.as_ref())
+                                .color(palette.dim)
+                                .font(theme::semibold(15.0)),
+                        )
+                        .font(theme::semibold(15.0))
+                        .text_color(palette.text)
+                        .frame(Frame::NONE)
+                        // WhatsApp refuses longer names.
+                        .char_limit(crate::model::GROUP_NAME_LIMIT)
+                        .desired_width(width - 20.0)
+                        .horizontal_align(align)
+                        .layouter(&mut layouter),
+                )
+            });
+        theme::focus_outline(
+            ui,
+            field.inner.id,
+            field.response.rect,
+            f32::from(theme::RADIUS),
+        );
+        // Read before focus is requested again below: egui answers
+        // `lost_focus` from the current focus, not from this frame's input.
+        if field.inner.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            outcome = Some(true);
+        } else if ui.memory(|memory| memory.focused().is_none()) {
+            field.inner.request_focus();
+        }
+        if theme::icon_button(
+            ui,
+            Icon::Check,
+            18.0,
+            palette.secondary,
+            palette.accent,
+            &crate::i18n::gettext(app.locale, "Save name (Enter)"),
+        )
+        .clicked()
+        {
+            outcome = Some(true);
+        }
+        if theme::icon_button(
+            ui,
+            Icon::X,
+            18.0,
+            palette.secondary,
+            palette.text,
+            &crate::i18n::gettext(app.locale, "Cancel (Escape)"),
+        )
+        .clicked()
+        {
+            outcome = Some(false);
+        }
+    });
+    outcome
+}
+
+/// The group name editor's text field.
+pub fn group_name_field_id() -> egui::Id {
+    egui::Id::new("group-name-field")
+}
+
+#[cfg(test)]
+mod tests {
+    /// The picture opens the viewer on its own, not a chat's album (#640).
+    #[test]
+    fn a_profile_picture_opens_alone_in_the_viewer() {
+        let path = std::path::Path::new("/fixture/1_s_whatsapp_net-full.jpg");
+        assert!(crate::image_preview::can_view(path));
+        let crate::model::Action::PreviewImage {
+            path: shown,
+            chat,
+            message,
+            card,
+        } = super::view_photo(path)
+        else {
+            panic!("the viewer");
+        };
+        assert_eq!(shown, path);
+        assert!(chat.is_empty() && message.is_empty() && card.is_none());
+    }
+
+    use super::domain;
+
+    #[test]
+    fn a_links_site_drops_the_scheme_the_www_and_the_path() {
+        assert_eq!(domain("https://spotifast.rocks/"), "spotifast.rocks");
+        assert_eq!(
+            domain("https://www.rust-lang.org/learn?x=1"),
+            "rust-lang.org"
+        );
+        assert_eq!(domain("engine.rocks#top"), "engine.rocks");
+    }
+
+    #[test]
+    fn a_links_site_is_the_host_the_browser_opens_not_its_userinfo() {
+        assert_eq!(
+            domain("https://bank.example@attacker.example/path"),
+            "attacker.example"
+        );
+        assert_eq!(
+            domain("https://user:pass@www.attacker.example:8080/"),
+            "attacker.example"
+        );
+    }
+
+    #[test]
+    fn groups_in_common_are_the_groups_we_still_share_by_name() {
+        use crate::model::Chat;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _events) = crate::app::App::headless(
+            crate::paths::AppDirs::under(directory.path()),
+            crate::settings::Settings::default(),
+        );
+        let me = "15550001111@s.whatsapp.net";
+        app.me = Some(me.to_owned());
+        let ada = "1@s.whatsapp.net";
+        let group = |id: &str, name: &str, members: &[&str]| {
+            let mut chat = Chat::new(id.into(), name.into());
+            chat.group_subject_known = true;
+            chat.participants = members.iter().map(|member| (*member).to_owned()).collect();
+            chat
+        };
+        let mut left = group("3@g.us", "Left", &[ada, me]);
+        left.left = true;
+        let mut locked = group("4@g.us", "Locked", &[ada, me]);
+        locked.locked = true;
+        app.chats = vec![
+            group("1@g.us", "Zeta", &[ada, "2@s.whatsapp.net", me]),
+            group("2@g.us", "alpha", &[ada, me]),
+            group("5@g.us", "Without Ada", &["2@s.whatsapp.net", me]),
+            // A member list without us: Ada is still in it, we are not.
+            group("6@g.us", "Removed", &[ada]),
+            left,
+            locked,
+            Chat::new(ada.into(), "Ada".into()),
+        ];
+        let names: Vec<String> = super::groups_in_common(&app, ada)
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+        assert_eq!(names, ["alpha", "Zeta"]);
+        assert!(super::groups_in_common(&app, "9@s.whatsapp.net").is_empty());
+    }
+}

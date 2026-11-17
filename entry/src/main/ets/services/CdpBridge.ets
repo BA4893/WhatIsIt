@@ -112,32 +112,146 @@ export interface ProvisionPayload {
   port: number;
 }
 
+/** A persisted backend endpoint (host + port + optional bearer token). */
+export class BackendEndpoint {
+  host: string = '';
+  port: number = 0;
+  token: string = '';
+}
+
 export class CdpBridge {
   private host: string = ServerConfig.BACKEND_HOST;
   private port: number = ServerConfig.BACKEND_PORT;
   private token: string = ServerConfig.BACKEND_TOKEN;
   private ws: webSocket.WebSocket | null = null;
   private wsConnected: boolean = false;
+  private wsRetryTimer: number | null = null;
   private listeners: EventListener[] = [];
   private lastChats: ChatSummary[] = [];
   private channelsCache: ChannelSummary[] = [];
   private currentChatId: string = '';
   private uiContext: common.UIAbilityContext | null = null;
+  /** Last human-readable failure (shown by the connect screen). */
+  private lastError: string = '';
+  /** Status code of the most recent httpJson() call. */
+  private lastHttpCode: number = 0;
 
   setUIContext(context: common.UIAbilityContext): void {
     this.uiContext = context;
   }
 
-  /** Hidden, persisted host override (admin-only; no UI). */
-  setEndpoint(host: string, port: number, token: string): void {
-    this.host = host;
-    this.port = port;
-    this.token = token;
+  /** Current endpoint host (for the hidden Server card / provisioning). */
+  getEndpointHost(): string {
+    return this.host;
+  }
+
+  /** Current endpoint port. */
+  getEndpointPort(): number {
+    return this.port;
+  }
+
+  /** Current bearer token (for prefilling the hidden Server card). */
+  getEndpointToken(): string {
+    return this.token;
+  }
+
+  /** Last connection error, or '' after a successful call. */
+  getLastError(): string {
+    return this.lastError;
+  }
+
+  /**
+   * Apply (and persist) a new backend endpoint, rebind the WebSocket and
+   * probe `/status`. Returns true only when the new host answered with a
+   * valid status payload.
+   */
+  async setEndpoint(host: string, port: number, token: string): Promise<boolean> {
+    // Accept a pasted "http://host:port/path" as well as a bare host.
+    let h = host.trim().replace(/^https?:\/\//i, '');
+    const slash = h.indexOf('/');
+    if (slash >= 0) {
+      h = h.substring(0, slash);
+    }
+    let p = port;
+    const colon = h.lastIndexOf(':');
+    if (colon > 0 && h.indexOf(']') < 0) {
+      const parsed = parseInt(h.substring(colon + 1), 10);
+      if (isFinite(parsed) && parsed > 0) {
+        p = parsed;
+        h = h.substring(0, colon);
+      }
+    }
+    if (h.length === 0 || !isFinite(p) || p <= 0 || p > 65535) {
+      this.lastError = 'Invalid server address';
+      return false;
+    }
+    this.host = h;
+    this.port = p;
+    this.token = token.trim();
     // Session credentials belong in the hardware-backed asset store, never a
     // plaintext config file. Best-effort: a missing STORE_PERSISTENT_DATA
     // grant only affects cross-upgrade persistence, not the in-memory token.
-    if (token.length > 0) {
-      secureCredentialStore.storeSessionToken(token).catch(() => {});
+    if (this.token.length > 0) {
+      secureCredentialStore.storeSessionToken(this.token).catch(() => {});
+    }
+    await this.persistEndpoint();
+    this.rebindWs();
+    return (await this.getStatus()) !== null;
+  }
+
+  /** Read the persisted endpoint, if any (does not apply it). */
+  async readStoredEndpoint(): Promise<BackendEndpoint | null> {
+    if (this.uiContext === null) {
+      return null;
+    }
+    try {
+      const prefs = await preferences.getPreferences(this.uiContext, 'whatisit_cdp');
+      const storedHost: string = String(await prefs.getSync(ServerConfig.BACKEND_HOST_PREF, ''));
+      if (storedHost.length === 0) {
+        return null;
+      }
+      const portRaw: string = String(await prefs.getSync(ServerConfig.BACKEND_PORT_PREF, ''));
+      const parsedPort = parseInt(portRaw, 10);
+      const ep = new BackendEndpoint();
+      ep.host = storedHost;
+      ep.port = isFinite(parsedPort) && parsedPort > 0 ? parsedPort : ServerConfig.BACKEND_PORT;
+      // The token is deliberately not persisted in plaintext prefs; it lives
+      // in memory + the asset store and must be re-entered after a restart
+      // until the asset read path lands in Phase 3.
+      ep.token = '';
+      return ep;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** Persist the current host/port and flush so a kill cannot lose it. */
+  private async persistEndpoint(): Promise<void> {
+    if (this.uiContext === null) {
+      return;
+    }
+    try {
+      const prefs = await preferences.getPreferences(this.uiContext, 'whatisit_cdp');
+      await prefs.put(ServerConfig.BACKEND_HOST_PREF, this.host);
+      await prefs.put(ServerConfig.BACKEND_PORT_PREF, String(this.port));
+      await prefs.flush();
+    } catch (e) {
+      // ignore: in-memory endpoint still works
+    }
+  }
+
+  /** Forget the persisted endpoint (used when a stored host goes stale). */
+  private async clearStoredEndpoint(): Promise<void> {
+    if (this.uiContext === null) {
+      return;
+    }
+    try {
+      const prefs = await preferences.getPreferences(this.uiContext, 'whatisit_cdp');
+      await prefs.put(ServerConfig.BACKEND_HOST_PREF, '');
+      await prefs.put(ServerConfig.BACKEND_PORT_PREF, '');
+      await prefs.flush();
+    } catch (e) {
+      // ignore
     }
   }
 
@@ -254,6 +368,11 @@ export class CdpBridge {
   }
 
   /** Probe a single host:port with a short timeout. Returns true if /status succeeds. */
+  /**
+   * Probe a host:port with a short timeout. Returns true only for a real
+   * backend: HTTP 200 AND a JSON `/status` body with a boolean `linked`.
+   * This rejects 401/403 pages, captive portals and arbitrary servers.
+   */
   private async probeHost(host: string, port: number, timeoutMs: number = 3000): Promise<boolean> {
     const req = http.createHttp();
     try {
@@ -265,11 +384,15 @@ export class CdpBridge {
         readTimeout: timeoutMs,
       };
       const resp = await req.request(url, options);
-      const result = resp.result;
-      if (typeof result === 'string' || typeof result === 'object') {
-        return true;
+      if (resp.responseCode !== 200) {
+        return false;
       }
-      return false;
+      const result = resp.result;
+      if (typeof result !== 'string') {
+        return false;
+      }
+      const parsed = JSON.parse(result) as Record<string, Object>;
+      return typeof parsed['linked'] === 'boolean';
     } catch (err) {
       return false;
     } finally {
@@ -278,66 +401,70 @@ export class CdpBridge {
   }
 
   /**
-   * Auto-discover the backend by probing known hosts.
-   * Persists the first reachable host to hidden preferences.
+   * Resolve the backend: a still-reachable stored endpoint wins, then the
+   * configured primary, then the built-in fallbacks. A stored endpoint that
+   * no longer answers is cleared (the old emulator 10.0.2.2 trap), instead of
+   * being returned blindly forever.
    */
   async discoverBackend(port: number = ServerConfig.BACKEND_PORT): Promise<string> {
+    const primaryHost = ServerConfig.BACKEND_HOST;
+    const primaryPort = port;
     if (!ServerConfig.AUTO_DISCOVER) {
+      this.host = primaryHost;
+      this.port = primaryPort;
       return this.host;
     }
-    const stored = await this.loadStoredHost();
-    if (stored.length > 0) {
-      this.host = stored;
-      this.port = port;
+
+    // 1) Previously configured endpoint, but only if it still answers.
+    const stored = await this.readStoredEndpoint();
+    if (stored !== null) {
+      const prevToken = this.token;
+      if (stored.token.length > 0) {
+        this.token = stored.token;
+      }
+      if (await this.probeHost(stored.host, stored.port)) {
+        this.host = stored.host;
+        this.port = stored.port;
+        this.lastError = '';
+        hilog.info(DOMAIN, TAG, 'using stored backend: %{public}s:%{public}d', this.host, this.port);
+        return this.host;
+      }
+      this.token = prevToken;
+      hilog.warn(DOMAIN, TAG, 'stored backend unreachable, clearing and re-probing');
+      await this.clearStoredEndpoint();
+    }
+
+    // 2) The compile-time primary must be probed too — the old code skipped it.
+    hilog.info(DOMAIN, TAG, 'probing primary backend: %{public}s:%{public}d', primaryHost, primaryPort);
+    if (await this.probeHost(primaryHost, primaryPort)) {
+      this.host = primaryHost;
+      this.port = primaryPort;
+      this.lastError = '';
+      await this.persistEndpoint();
       return this.host;
     }
-    const candidates = ServerConfig.BACKEND_FALLBACKS;
-    for (const host of candidates) {
-      if (host === this.host) {
+
+    // 3) Fallbacks.
+    for (const host of ServerConfig.BACKEND_FALLBACKS) {
+      if (host === primaryHost) {
         continue;
       }
-      hilog.info(DOMAIN, TAG, 'probing backend host: %{public}s:%{public}d', host, port);
-      const ok = await this.probeHost(host, port);
-      if (ok) {
+      hilog.info(DOMAIN, TAG, 'probing fallback backend: %{public}s:%{public}d', host, primaryPort);
+      if (await this.probeHost(host, primaryPort)) {
         this.host = host;
-        this.port = port;
-        await this.persistHost(host);
+        this.port = primaryPort;
+        this.lastError = '';
+        await this.persistEndpoint();
         hilog.info(DOMAIN, TAG, 'backend discovered: %{public}s', host);
         return host;
       }
     }
-    hilog.warn(DOMAIN, TAG, 'backend auto-discovery failed, using default: %{public}s', this.host);
+
+    this.host = primaryHost;
+    this.port = primaryPort;
+    this.lastError = 'Can\'t reach ' + primaryHost + ':' + primaryPort;
+    hilog.warn(DOMAIN, TAG, 'backend auto-discovery failed');
     return this.host;
-  }
-
-  /** Load any previously stored backend host from hidden preferences. */
-  private async loadStoredHost(): Promise<string> {
-    if (this.uiContext === null) {
-      return '';
-    }
-    try {
-      const prefs = await preferences.getPreferences(this.uiContext, 'whatisit_cdp');
-      const stored: string = String(await prefs.getSync(ServerConfig.BACKEND_HOST_PREF, ''));
-      if (stored.length > 0) {
-        return stored;
-      }
-    } catch (e) {
-      // ignore
-    }
-    return '';
-  }
-
-  /** Persist the working backend host to hidden preferences. */
-  private async persistHost(host: string): Promise<void> {
-    if (this.uiContext === null) {
-      return;
-    }
-    try {
-      const prefs = await preferences.getPreferences(this.uiContext, 'whatisit_cdp');
-      await prefs.put(ServerConfig.BACKEND_HOST_PREF, host);
-    } catch (e) {
-      // ignore
-    }
   }
 
   /** Apply a provisioning payload: host + optional port. Persists and reconnects. */
@@ -347,10 +474,7 @@ export class CdpBridge {
       return false;
     }
     const p: number = port !== undefined && port > 0 ? port : ServerConfig.BACKEND_PORT;
-    this.host = trimmed;
-    this.port = p;
-    await this.persistHost(trimmed);
-    return this.connect(p, trimmed);
+    return this.setEndpoint(trimmed, p, this.token);
   }
 
   /** Parse a provisioning deep-link URL: whatisit://provision?host=...&port=... */
@@ -400,6 +524,53 @@ export class CdpBridge {
     return this.wsConnected;
   }
 
+  /** True only when the embedded native WhatsApp engine is actually loaded. */
+  hasNativeEngine(): boolean {
+    return waEngine.isReady();
+  }
+
+  /** Short probe for a server running on this same device (dev/2in1). */
+  async probeLocal(): Promise<boolean> {
+    return this.probeHost('127.0.0.1', ServerConfig.BACKEND_PORT, 1500);
+  }
+
+  /** Close the current socket without scheduling a reconnect. */
+  private closeWs(): void {
+    const old = this.ws;
+    this.ws = null;
+    this.wsConnected = false;
+    if (old !== null) {
+      try {
+        old.close().catch(() => {});
+      } catch (e) {
+        // ignore
+      }
+    }
+  }
+
+  /** One reconnect at a time; the timer re-checks that no socket exists. */
+  private scheduleWsReconnect(delayMs: number): void {
+    if (this.wsRetryTimer !== null) {
+      return;
+    }
+    this.wsRetryTimer = setTimeout(() => {
+      this.wsRetryTimer = null;
+      if (this.ws === null) {
+        this.openWs();
+      }
+    }, delayMs);
+  }
+
+  /** Close and reopen the WS against the current endpoint (host change). */
+  private rebindWs(): void {
+    this.closeWs();
+    if (this.wsRetryTimer !== null) {
+      clearTimeout(this.wsRetryTimer);
+      this.wsRetryTimer = null;
+    }
+    this.openWs();
+  }
+
   openWs(): void {
     const self = this;
     if (this.ws !== null) {
@@ -427,21 +598,31 @@ export class CdpBridge {
     });
     ws.on('open', () => {
       self.wsConnected = true;
+      self.lastError = '';
     });
     ws.on('close', () => {
       self.wsConnected = false;
-      self.ws = null;
-      setTimeout(() => {
-        if (self.ws === null) {
-          self.openWs();
-        }
-      }, 5000);
+      if (self.ws === ws) {
+        self.ws = null;
+      }
+      self.scheduleWsReconnect(5000);
     });
     ws.on('error', () => {
       self.wsConnected = false;
+      if (self.ws === ws) {
+        self.ws = null;
+      }
+      self.scheduleWsReconnect(5000);
     });
-    ws.connect(this.getWsUrl()).catch(() => {
+    // The server's /ws guard accepts ?token= as well as the bearer header.
+    const url = this.getWsUrl() +
+      (this.token.length > 0 ? '?token=' + encodeURIComponent(this.token) : '');
+    ws.connect(url).catch(() => {
       self.wsConnected = false;
+      if (self.ws === ws) {
+        self.ws = null;
+      }
+      self.scheduleWsReconnect(5000);
     });
   }
 
@@ -449,6 +630,7 @@ export class CdpBridge {
 
   private async httpJson(method: string, path: string, body?: string): Promise<Record<string, Object> | null> {
     const req = http.createHttp();
+    this.lastHttpCode = 0;
     try {
       const url = this.getBaseUrl() + path;
       const options: http.HttpRequestOptions = {
@@ -461,18 +643,28 @@ export class CdpBridge {
         options.extraData = body;
       }
       const resp = await req.request(url, options);
+      this.lastHttpCode = resp.responseCode;
       const result = resp.result;
       if (typeof result === 'string') {
         if (result.length === 0) {
           return null;
         }
-        return JSON.parse(result) as Record<string, Object>;
+        const parsed = JSON.parse(result) as Record<string, Object>;
+        if (resp.responseCode < 200 || resp.responseCode >= 300) {
+          const err = parsed['error'];
+          this.lastError = typeof err === 'string' ? (err as string) :
+            ('Server returned HTTP ' + resp.responseCode);
+          hilog.warn(DOMAIN, TAG, 'http %{public}s -> %{public}d %{public}s',
+            path, resp.responseCode, this.lastError);
+        }
+        return parsed;
       }
       if (typeof result === 'object' && result !== null) {
         return result as Record<string, Object>;
       }
       return null;
     } catch (err) {
+      this.lastError = 'network error';
       hilog.warn(DOMAIN, TAG, 'http %{public}s failed: %{public}s', path, JSON.stringify(err));
       return null;
     } finally {
@@ -502,26 +694,34 @@ export class CdpBridge {
   // ---- status / pairing ----
 
   async getStatus(): Promise<StatusResponse | null> {
-    // Embedded engine (in-app "server"): read status directly via NAPI.
+    // Embedded engine (in-app "server"): read status directly via NAPI. Only
+    // trust a real payload; an empty/broken engine must fall through to HTTP.
     if (waEngine.isReady()) {
       const engRaw = waEngine.status();
       if (engRaw.length > 0) {
         try {
           const parsed = JSON.parse(engRaw) as Record<string, Object>;
-          return {
-            linked: parsed['linked'] === true,
-            phone: typeof parsed['phone'] === 'string' ? (parsed['phone'] as string) : '',
-            qr: typeof parsed['qr'] === 'string' ? (parsed['qr'] as string) : '',
-          } as StatusResponse;
+          if (typeof parsed['linked'] === 'boolean') {
+            return {
+              linked: parsed['linked'] === true,
+              phone: typeof parsed['phone'] === 'string' ? (parsed['phone'] as string) : '',
+              qr: typeof parsed['qr'] === 'string' ? (parsed['qr'] as string) : '',
+            } as StatusResponse;
+          }
         } catch (e) {
           // fall through to HTTP
         }
       }
     }
     const resp = await this.httpJson('GET', '/status');
-    if (resp === null) {
+    if (resp === null || this.lastHttpCode !== 200) {
       return null;
     }
+    if (typeof resp['linked'] !== 'boolean') {
+      this.lastError = 'Unexpected /status response';
+      return null;
+    }
+    this.lastError = '';
     return {
       linked: resp['linked'] === true,
       phone: typeof resp['phone'] === 'string' ? (resp['phone'] as string) : '',
@@ -543,7 +743,14 @@ export class CdpBridge {
       return true;
     }
     const resp = await this.httpJson('POST', '/pair');
-    return resp !== null;
+    if (resp === null || this.lastHttpCode < 200 || this.lastHttpCode >= 300) {
+      if (this.lastError.length === 0) {
+        this.lastError = 'Failed to start pairing';
+      }
+      return false;
+    }
+    this.lastError = '';
+    return true;
   }
 
   /** Phone-number linking: request an 8-char code for country+phone. */
@@ -568,12 +775,15 @@ export class CdpBridge {
     const body = JSON.stringify({ country, phone, full });
     const resp = await this.httpJson('POST', '/pair-code', body);
     if (resp === null) {
-      throw new Error('pair-code request failed');
+      throw new Error(this.lastError.length > 0 ? this.lastError : 'pair-code request failed');
     }
     // The backend surfaces the error message (e.g. WhatsApp rate-limit).
     if (resp['error'] !== undefined) {
       const msg = resp['error'];
       throw new Error(typeof msg === 'string' ? (msg as string) : 'pair-code request failed');
+    }
+    if (this.lastHttpCode < 200 || this.lastHttpCode >= 300) {
+      throw new Error('pair-code failed (HTTP ' + this.lastHttpCode + ')');
     }
     // Return the 8-char code from the HTTP response so the UI shows it
     // immediately; the pair_code WS event is a backup path.
@@ -582,7 +792,14 @@ export class CdpBridge {
   }
 
   async logout(): Promise<boolean> {
-    return waEngine.logout();
+    // Embedded engine first (if one is ever built), then the HTTP backend.
+    if (waEngine.isReady()) {
+      if (waEngine.logout()) {
+        return true;
+      }
+    }
+    const resp = await this.httpJson('POST', '/logout');
+    return resp !== null && this.lastHttpCode === 200;
   }
 
   // ---- passkey (SHORTCAKE) ----

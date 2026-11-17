@@ -1,0 +1,6 @@
+# ZapFast's ArkTS side is one page and a NAPI declaration; nothing here needs
+# obfuscating, and the native host's symbols must stay as they are.
+-enable-property-obfuscation
+-enable-toplevel-obfuscation
+-enable-filename-obfuscation
+-enable-export-obfuscation

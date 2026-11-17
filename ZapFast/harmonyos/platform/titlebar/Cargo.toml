@@ -1,0 +1,17 @@
+[package]
+name = "zapfast-platform-titlebar"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "The fastframe-titlebar surface ZapFast uses: the desktop crate itself, or zero caption room on HarmonyOS"
+
+[lib]
+name = "fastframe_titlebar"
+path = "src/lib.rs"
+
+[target.'cfg(not(target_env = "ohos"))'.dependencies]
+upstream = { package = "fastframe-titlebar", git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
+
+[target.'cfg(target_env = "ohos")'.dependencies]
+egui = "0.36.2"

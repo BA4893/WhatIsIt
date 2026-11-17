@@ -1,0 +1,181 @@
+name: CI
+
+# Pull requests run Linux only: the account's 20 hosted runners are shared
+# by every repository, and a full matrix per push to a pull request kept
+# them all busy for hours (2026-10-26). macOS, Windows, Debian 12 and the
+# other Nix systems run on main, so a platform break shows there before a
+# release tag. Changes to documentation alone skip the build entirely; the
+# required `policy` check lives in policy.yml so it still reports on them.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - docs/**
+      - '**.md'
+  pull_request:
+    paths-ignore:
+      - docs/**
+      - '**.md'
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked --no-default-features
+      - name: Audit all locked dependencies
+        run: cargo audit
+
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libasound2-dev libpipewire-0.3-dev clang libclang-dev cmake perl
+      # After the toolchain, so the cache key follows the pinned rustc. The
+      # key carries no job name, so each job sets its own generation. Saves
+      # only on pushes to main; pull requests restore.
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          cache-generation: quality-v1
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Clippy (default features)
+        run: mbx clippy --locked --all-targets -- -D warnings
+      - name: Clippy (all features)
+        run: mbx clippy --locked --all-targets --all-features -- -D warnings
+      - name: Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: mbx doc --locked --all-features --no-deps
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # A cold Windows build passed both suites in 59 minutes, then timed out
+    # saving mbx's cache. Leave enough time for that cache to reach later runs.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 90 || 60 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest", "macos-latest", "windows-latest"]') }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: GUI build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libasound2-dev libpipewire-0.3-dev clang libclang-dev cmake perl
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          cache-generation: test-v1
+      # The demo feature carries the headless layout test of every screen.
+      - name: Tests (default features)
+        run: mbx test --locked --all-targets
+      - name: Tests (all features)
+        run: mbx test --locked --all-targets --all-features
+      - name: Build macOS demo
+        if: runner.os == 'macOS'
+        run: mbx build --locked --features demo
+      - name: macOS window smoke test
+        if: runner.os == 'macOS'
+        timeout-minutes: 3
+        run: |
+          target/debug/zapfast --demo --demo-shot "$RUNNER_TEMP/zapfast-content.png" --demo-shot-delay 8000 &
+          demo_pid=$!
+          sleep 6
+          screencapture -x "$RUNNER_TEMP/zapfast-window.png" || true
+          wait "$demo_pid"
+          test -s "$RUNNER_TEMP/zapfast-content.png"
+      - name: macOS preview
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-preview
+          path: ${{ runner.temp }}/zapfast-*.png
+
+  # Linux releases build in Debian 12 for its older glibc (release.yml).
+  # Building here too catches a dependency that needs newer system
+  # libraries before a release tag does.
+  debian-12:
+    name: compile (Debian 12)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    container: debian:12
+    timeout-minutes: 45
+    steps:
+      - name: GUI build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev libasound2-dev \
+            libpipewire-0.3-dev clang libclang-dev cmake perl
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --locked
+
+  windows-arm64:
+    name: compile (Windows arm64)
+    if: github.event_name != 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+      - run: rustup target add aarch64-pc-windows-msvc
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          cache-generation: windows-arm64-v1
+      - run: mbx check --locked --all-targets --all-features --target aarch64-pc-windows-msvc
+
+  nix:
+    name: Nix package (${{ matrix.system }})
+    runs-on: ${{ matrix.os }}
+    # Uncached, aarch64-darwin takes about 53 minutes, Linux about 22.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"os":"ubuntu-latest","system":"x86_64-linux"}]' || '[{"os":"ubuntu-latest","system":"x86_64-linux"},{"os":"ubuntu-24.04-arm","system":"aarch64-linux"},{"os":"macos-latest","system":"aarch64-darwin"}]') }}
+    steps:
+      - uses: actions/checkout@v7
+      # Frees disk space on Ubuntu runners; macOS runners have enough.
+      - uses: wimpysworld/nothing-but-nix@v9
+        if: runner.os == 'Linux'
+      - uses: cachix/install-nix-action@v31
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          save: ${{ github.ref == 'refs/heads/main' }}
+          primary-key: nix-${{ matrix.system }}-${{ hashFiles('**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ matrix.system }}-
+      - name: Check flake outputs
+        run: nix flake check --no-build
+      - name: Build package
+        run: nix build .#default

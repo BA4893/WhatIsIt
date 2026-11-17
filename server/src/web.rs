@@ -12,7 +12,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use whatsapp_rust::prelude::*;
 
-use crate::state::{AppState, Event};
+use crate::state::{AppState, CallLogEntry, Event};
 
 /// Build the axum router.
 pub fn router(state: AppState, client: Arc<whatsapp_rust::Client>) -> Router {
@@ -28,6 +28,7 @@ pub fn router(state: AppState, client: Arc<whatsapp_rust::Client>) -> Router {
         .route("/react", post(react))
         .route("/logout", post(logout))
         .route("/media/{id}/{kind}", get(media))
+        .route("/calls", get(call_history))
         .route("/call", post(call_start))
         .route("/call/accept", post(call_accept))
         .route("/call/reject", post(call_reject))
@@ -348,6 +349,24 @@ struct CallStartBody {
     video: bool,
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+async fn call_history(
+    State(api): State<ApiState>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    if !authorized(&headers, &uri, &api.state.cfg) {
+        return reject();
+    }
+    Json(serde_json::json!({ "calls": api.state.calls() })).into_response()
+}
+
 async fn call_start(
     State(api): State<ApiState>,
     headers: HeaderMap,
@@ -361,7 +380,19 @@ async fn call_start(
         return (StatusCode::FORBIDDEN, Json(serde_json::json!({ "error": "not linked" }))).into_response();
     }
     match crate::calls::start_call(&api.client, &api.state.calls, &body.chat, body.video).await {
-        Ok(call_id) => Json(serde_json::json!({ "ok": true, "callId": call_id })).into_response(),
+        Ok(call_id) => {
+            let name = api.state.store.name_for(&body.chat);
+            api.state.add_call(CallLogEntry {
+                id: call_id.clone(),
+                peer: body.chat.clone(),
+                dir: "out".into(),
+                video: body.video,
+                missed: false,
+                time: now_ms(),
+                name,
+            });
+            Json(serde_json::json!({ "ok": true, "callId": call_id })).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
     }
 }
@@ -390,7 +421,20 @@ async fn call_accept(
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "incoming call expired" }))).into_response();
     };
     match crate::calls::accept_call(&api.client, &api.state.calls, &incoming, body.video).await {
-        Ok(call_id) => Json(serde_json::json!({ "ok": true, "callId": call_id })).into_response(),
+        Ok(call_id) => {
+            let peer = pending.from.clone();
+            let name = api.state.store.name_for(&peer);
+            api.state.add_call(CallLogEntry {
+                id: call_id.clone(),
+                peer,
+                dir: "in".into(),
+                video: body.video,
+                missed: false,
+                time: now_ms(),
+                name,
+            });
+            Json(serde_json::json!({ "ok": true, "callId": call_id })).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
     }
 }
@@ -407,11 +451,23 @@ async fn call_reject(
     let Some(pending) = api.state.calls.take_pending(&body.call_id) else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "no such incoming call" }))).into_response();
     };
+    let peer = pending.from.clone();
+    let video = pending.video;
     if let Some(incoming) = pending.incoming {
         if let Err(e) = crate::calls::reject_call(&api.client, &incoming).await {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))).into_response();
         }
     }
+    let name = api.state.store.name_for(&peer);
+    api.state.add_call(CallLogEntry {
+        id: body.call_id.clone(),
+        peer,
+        dir: "in".into(),
+        video,
+        missed: true,
+        time: now_ms(),
+        name,
+    });
     Json(serde_json::json!({ "ok": true })).into_response()
 }
 

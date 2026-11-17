@@ -108,6 +108,11 @@
         "startWindowBackground": "$color:start_window_background",
         "exported": true,
         "continuable": true,
+        "supportWindowMode": [
+          "fullscreen",
+          "split",
+          "floating"
+        ],
         "backgroundModes": [
           "voip",
           "audioPlayback"
@@ -119,6 +124,17 @@
             ],
             "actions": [
               "ohos.want.action.home"
+            ]
+          },
+          {
+            "actions": [
+              "ohos.want.action.viewData"
+            ],
+            "uris": [
+              {
+                "scheme": "whatisit",
+                "host": "callback"
+              }
             ]
           }
         ]

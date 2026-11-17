@@ -1,0 +1,14 @@
+[package]
+name = "zapfast-platform-openh264"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "The openh264 surface ZapFast uses: the desktop crate itself, or a HarmonyOS stand-in until AVCodec is bound"
+
+[lib]
+name = "openh264"
+path = "src/lib.rs"
+
+[target.'cfg(not(target_env = "ohos"))'.dependencies]
+upstream = { package = "openh264", version = "0.9" }

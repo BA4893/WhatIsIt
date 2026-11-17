@@ -1,0 +1,28 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "ZapFast, a native WhatsApp client"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "ZapFast, a native WhatsApp client"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "ZapFast"
+    },
+    {
+      "name": "microphone_reason",
+      "value": "Record voice messages and speak in calls"
+    },
+    {
+      "name": "camera_reason",
+      "value": "Use the camera for video calls"
+    },
+    {
+      "name": "background_reason",
+      "value": "Keep calls connected and receive messages while ZapFast is in the background"
+    }
+  ]
+}

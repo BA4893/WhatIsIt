@@ -18,11 +18,12 @@ import { ContactPickerService } from '../services/ContactPickerService';
 import { ServerConfig } from '../services/ServerConfig';
 import { callService } from '../services/CallService';
 import { CallSurfaceView } from './CallSurfaceView';
+import { WebLoginView } from './WebLoginView';
 
 const TAG = 'MainPage';
 const DOMAIN = 0x0000;
 
-type ShellView = 'connect' | 'chats' | 'thread' | 'newchat' | 'channels' | 'statuscomposer';
+type ShellView = 'connect' | 'chats' | 'thread' | 'newchat' | 'channels' | 'statuscomposer' | 'web';
 
 @Entry
 @Component
@@ -45,8 +46,6 @@ struct MainPage {
   @State assertionInput: string = '';
   @State passkeyBusy: boolean = false;
   @State securityBlocked: boolean = false;
-  @State showProvisionQR: boolean = false;
-  @State provisionUrl: string = '';
   @State incomingCallId: string = '';
   @State incomingFrom: string = '';
   @State incomingVideo: boolean = false;
@@ -54,8 +53,11 @@ struct MainPage {
   @State activeCallName: string = '';
   @State activeCallVideo: boolean = false;
   @State activeCallSurface: boolean = false;
+  @State connectionError: string = '';
   private store: preferences.Preferences | null = null;
   private qrTimer: number | null = null;
+  private statusFailures: number = 0;
+  private booted: boolean = false;
 
   aboutToAppear(): void {
     // BOOT BARRIER: verify hardware integrity BEFORE any session/UI init.
@@ -81,10 +83,10 @@ struct MainPage {
     localNotifications.init(ctx);
     localNotifications.requestPermission();
     localNotifications.clearBadge();
-    // Start the embedded engine (the "server" — in-process, no network).
-    cdpBridge.startEngine(`${ctx.filesDir}/wa`);
     cdpBridge.setUIContext(ctx);
-    cdpBridge.openWs();
+    // Mark booted before the async prefs read so onPageShow() cannot race in
+    // and start a second discovery/pairing pass against an uninitialised store.
+    this.booted = true;
     preferences.getPreferences(ctx, 'whatisit_cdp').then((store) => {
       this.store = store;
       // App Continuation resume: if we were handed off into a chat, open it.
@@ -119,6 +121,7 @@ struct MainPage {
     cdpBridge.addEventListener((evt: BackendEvent) => {
       if (evt.type === 'qr' && evt.qr !== undefined) {
         this.qr = evt.qr;
+        this.connectionError = '';
       } else if (evt.type === 'status') {
         // Sent by the server on every WS (re)connect. A server that reports
         // not-linked means the session is gone (server reset/logout/relink),
@@ -126,21 +129,35 @@ struct MainPage {
         if (evt.linked === true) {
           this.qr = '';
           this.view = 'chats';
+          this.connectionError = '';
           this.stopQrPoll();
         } else if (evt.qr !== undefined && evt.qr.length > 0) {
           this.qr = evt.qr;
           this.view = 'connect';
+          this.connectionError = '';
           this.startQrPoll();
+        } else {
+          // Unlinked with no QR yet: make sure a pairing stream is running.
+          this.qr = '';
+          this.view = 'connect';
+          this.startQrPoll();
+          this.restartPairing();
         }
       } else if (evt.type === 'linked') {
         this.qr = '';
         this.view = 'chats';
+        this.connectionError = '';
+        this.stopQrPoll();
+        localNotifications.start();
         if (this.store !== null) {
           this.store.put('was_linked', true).catch(() => {});
         }
       } else if (evt.type === 'logged_out') {
         this.qr = '';
         this.view = 'connect';
+        this.connectionError = '';
+        this.stopQrPoll();
+        this.restartPairing();
       } else if (evt.type === 'pair_code' && evt.code !== undefined) {
         this.pairCodeText = evt.code;
         this.pairBusy = false;
@@ -158,6 +175,10 @@ struct MainPage {
       this.passkeyCode = s.verificationCode;
       this.passkeyError = s.error;
     });
+    // Start the embedded engine last, after every listener is registered, so
+    // an immediate qr/linked event cannot be dropped. Without libwa_engine.so
+    // this is a harmless no-op and the HTTP backend is used.
+    cdpBridge.startEngine(`${ctx.filesDir}/wa`);
   }
 
   aboutToDisappear(): void {
@@ -167,6 +188,9 @@ struct MainPage {
   /** App came to foreground — resume polling. */
   onPageShow(): void {
     AppLifecycle.setForeground(true);
+    if (!this.booted) {
+      return;
+    }
     this.autoReconnect();
   }
 
@@ -197,8 +221,14 @@ struct MainPage {
   private async pollStatus(): Promise<void> {
     const st = await cdpBridge.getStatus();
     if (st === null) {
+      this.statusFailures++;
+      if (this.statusFailures >= 2) {
+        this.connectionError = this.connectionErrorText();
+      }
       return;
     }
+    this.statusFailures = 0;
+    this.connectionError = '';
     if (st.linked) {
       this.qr = '';
       this.view = 'chats';
@@ -208,37 +238,72 @@ struct MainPage {
     }
   }
 
-  /** Try to silently re-attach to the engine; resume chats if linked. */
+  /** Try to silently re-attach to the backend; resume chats if linked. */
   private async autoReconnect(): Promise<void> {
     if (this.view !== 'connect') {
       return;
     }
+    // No native engine and no configured server: go straight to the real
+    // WhatsApp Web login (QR / phone-number linking) instead of showing an
+    // unreachable 127.0.0.1 backend. A local server on a 2in1 dev box is still
+    // detected by the short loopback probe.
+    if (!cdpBridge.hasNativeEngine()) {
+      const stored = await cdpBridge.readStoredEndpoint();
+      const configured = stored !== null ? stored.host : ServerConfig.BACKEND_HOST;
+      const loopback = configured === '127.0.0.1' || configured === 'localhost';
+      if (loopback && !(await cdpBridge.probeLocal())) {
+        this.enterWebMode();
+        return;
+      }
+    }
     await cdpBridge.discoverBackend();
+    cdpBridge.openWs();
     const linked = await cdpBridge.isLinked();
     if (linked) {
       this.view = 'chats';
+      this.connectionError = '';
       if (this.store !== null) {
         this.store.put('was_linked', true).catch(() => {});
       }
-    } else {
-      // Not linked — start QR pairing and watch for the code.
-      await cdpBridge.startPair();
-      this.startQrPoll();
-      this.pollStatus();
+      return;
     }
+    // Not linked — start QR pairing and watch for the code.
+    const ok = await cdpBridge.startPair();
+    if (!ok) {
+      // No native backend available: use the real WhatsApp Web login.
+      this.enterWebMode();
+      return;
+    }
+    this.startQrPoll();
+    this.pollStatus();
+  }
+
+  /** WhatsApp Web fallback: no backend host/port/token is needed. */
+  private enterWebMode(): void {
+    this.stopQrPoll();
+    this.connectionError = '';
+    this.pairError = '';
+    this.view = 'web';
   }
 
   private async connect(): Promise<void> {
     this.connecting = true;
     this.errorMsg = '';
+    this.connectionError = '';
+    this.statusFailures = 0;
     await cdpBridge.discoverBackend();
+    cdpBridge.openWs();
     const linked = await cdpBridge.isLinked();
     this.connecting = false;
     if (linked) {
       this.view = 'chats';
       localNotifications.start();
     } else {
-      await cdpBridge.startPair();
+      const ok = await cdpBridge.startPair();
+      if (!ok) {
+        this.enterWebMode();
+        return;
+      }
       this.startQrPoll();
       this.pollStatus();
     }
@@ -249,12 +314,49 @@ struct MainPage {
     this.errorMsg = '';
     const ok = await cdpBridge.provisionBackend(host, port);
     if (ok) {
-      await cdpBridge.startPair();
-      this.startQrPoll();
-      this.pollStatus();
+        await this.startPairAfterEndpoint();
     } else {
       this.errorMsg = 'Provisioning failed. Check the backend URL and try again.';
     }
+  }
+
+  /** Start pairing after an endpoint change and keep the UI honest. */
+  private async startPairAfterEndpoint(): Promise<void> {
+    const ok = await cdpBridge.startPair();
+    if (!ok) {
+      this.connectionError = this.connectionErrorText();
+    } else {
+      this.connectionError = '';
+    }
+    this.startQrPoll();
+    this.pollStatus();
+  }
+
+  /** Best-effort pairing restart after a logged_out / WS status event. */
+  private async restartPairing(): Promise<void> {
+    const ok = await cdpBridge.startPair();
+    if (!ok) {
+      this.enterWebMode();
+      return;
+    }
+    this.connectionError = '';
+    this.startQrPoll();
+    this.pollStatus();
+  }
+
+  /** Human-readable reachability error (no IP/server details in the UI). */
+  private connectionErrorText(): string {
+    return 'Native WhatsApp backend unavailable. Tap Retry, or continue with WhatsApp Web.';
+  }
+
+  /** Real logout: clear the server session, then present a fresh QR. */
+  private async logoutAndReset(): Promise<void> {
+    await cdpBridge.logout();
+    this.qr = '';
+    this.pairCodeText = '';
+    this.view = 'connect';
+    this.stopQrPoll();
+    await this.restartPairing();
   }
 
   private openThread(name: string): void {
@@ -274,20 +376,33 @@ struct MainPage {
     this.pairBusy = true;
     this.pairError = '';
     this.pairCodeText = '';
-    const digits = this.phoneNumber.replace(/[^0-9]/g, '');
-    if (this.phoneCountry.length === 0 || digits.length < 7) {
-      this.pairError = 'Enter a valid phone number.';
+    const country = this.phoneCountry.replace(/[^0-9]/g, '').replace(/^0+/, '');
+    let national = this.phoneNumber.replace(/[^0-9]/g, '');
+    // whatsmeow rejects numbers starting with 0 (national trunk prefix) and
+    // the server concatenates country+phone, so normalise here:
+    //  - drop a leading 0 ("07700…" -> "7700…")
+    //  - if the user pasted the country code into the number box, remove it
+    national = national.replace(/^0+/, '');
+    if (country.length > 0 && national.startsWith(country) && national.length > country.length + 6) {
+      national = national.substring(country.length);
+    }
+    if (country.length === 0 || national.length < 7) {
+      this.pairError = 'Enter a country code and a national number (no leading 0).';
       this.pairBusy = false;
       return;
     }
     let code = '';
     try {
-      code = await cdpBridge.pairCode(this.phoneCountry, digits);
+      code = await cdpBridge.pairCode(country, national);
     } catch (err) {
       const msg = (err as Error)?.message;
-      this.pairError = msg !== undefined && msg.length > 0
-        ? msg
-        : 'Failed to request code. Is the backend running?';
+      if (msg === 'network error') {
+        this.pairError = 'Couldn\'t reach WhatsApp. Check your connection and try again.';
+      } else {
+        this.pairError = msg !== undefined && msg.length > 0
+          ? msg
+          : 'Failed to request code. Check your connection and try again.';
+      }
       this.pairBusy = false;
       return;
     }
@@ -455,21 +570,6 @@ struct MainPage {
     this.activeCallSurface = false;
   }
 
-  /** Build a provisioning deep-link URL for the current backend. */
-  private buildProvisionUrl(): string {
-    const host = ServerConfig.BACKEND_HOST;
-    const port = ServerConfig.BACKEND_PORT;
-    return ServerConfig.PROVISION_SCHEME + '://' + ServerConfig.PROVISION_HOST + '?host=' + encodeURIComponent(host) + '&port=' + port;
-  }
-
-  /** Toggle the provisioning QR card on the connect screen. */
-  private toggleProvisionQR(): void {
-    this.showProvisionQR = !this.showProvisionQR;
-    if (this.showProvisionQR) {
-      this.provisionUrl = this.buildProvisionUrl();
-    }
-  }
-
   /** Animate view switches with an elegant spring curve. */
   private animatedSetView(v: ShellView): void {
     this.getUIContext().animateTo({
@@ -620,6 +720,10 @@ struct MainPage {
                 .fontSize(12)
                 .fontColor($r('app.color.ink_subtle'))
                 .textAlign(TextAlign.Center)
+              Text('Country code separately; national number without the leading 0. After typing the code in WhatsApp, approve the "Link a device" notification on the phone.')
+                .fontSize(10)
+                .fontColor($r('app.color.ink_faded'))
+                .textAlign(TextAlign.Center)
 
               Row({ space: 8 }) {
                 // Country code.
@@ -665,7 +769,7 @@ struct MainPage {
 
               if (this.pairCodeText.length > 0) {
                 Column({ space: 6 }) {
-                  Text('Enter this 8-character code in WhatsApp (Link with phone number instead):')
+                  Text('Enter this 8-character code in WhatsApp (Link with phone number instead), then approve the link on the phone:')
                     .fontSize(11)
                     .fontColor($r('app.color.ink_subtle'))
                     .textAlign(TextAlign.Center)
@@ -784,52 +888,7 @@ struct MainPage {
             .shadow({ radius: 8, color: '#11000000', offsetY: 2 })
           }
 
-          // ---- Provisioning QR (for air-gapped / per-customer deployments) ----
-          Button(this.showProvisionQR ? 'Hide provisioning QR' : 'Provision another device')
-            .width('70%')
-            .height(44)
-            .backgroundColor('#FFFFFF')
-            .fontColor($r('app.color.brand'))
-            .border({ width: 1, color: $r('app.color.brand') })
-            .borderRadius(22)
-            .onClick(() => {
-              this.toggleProvisionQR();
-            })
-
-          if (this.showProvisionQR) {
-            Column({ space: 12 }) {
-              Text('Scan this QR with another WhatIsIt device to auto-configure the backend.')
-                .fontSize(12)
-                .fontColor($r('app.color.ink_subtle'))
-                .textAlign(TextAlign.Center)
-              Stack() {
-                if (this.provisionUrl.length > 0) {
-                  QRCode(this.provisionUrl)
-                    .width(200)
-                    .height(200)
-                    .backgroundColor('#FFFFFF')
-                    .borderRadius(8)
-                }
-              }
-              .width(220)
-              .height(220)
-              .backgroundColor('#FFFFFF')
-              .borderRadius(12)
-              .border({ width: 1, color: '#DDDDDD' })
-              Text('URL: ' + this.provisionUrl)
-                .fontSize(10)
-                .fontColor($r('app.color.ink_faded'))
-                .textAlign(TextAlign.Center)
-                .padding({ left: 12, right: 12 })
-            }
-            .width('85%')
-            .padding(16)
-            .backgroundColor('#FFFFFF')
-            .borderRadius(12)
-            .shadow({ radius: 8, color: '#11000000', offsetY: 2 })
-          }
-
-          Button(this.connecting ? 'Connecting…' : 'Refresh QR')
+          Button(this.connecting ? 'Connecting…' : (this.connectionError.length > 0 ? 'Retry' : 'Refresh QR'))
             .width('70%')
             .height(48)
             .backgroundColor($r('app.color.brand'))
@@ -845,6 +904,7 @@ struct MainPage {
               .textAlign(TextAlign.Center)
               .padding({ left: 24, right: 24 })
           }
+
           Blank()
           }
           .width('100%')
@@ -856,12 +916,16 @@ struct MainPage {
         .width('100%')
         .height('100%')
         .transition(this.connectTransition())
+      } else if (this.view === 'web') {
+        WebLoginView()
+          .width('100%')
+          .height('100%')
+          .transition(this.connectTransition())
       } else if (this.view === 'chats') {
         ChatListView({ onOpenChat: (name: string) => {
           this.openThread(name);
         }, onLoggedOut: () => {
-          this.view = 'connect';
-          this.stopQrPoll();
+          this.logoutAndReset();
         }, onHandOff: () => {
           this.handOff();
         }, onNewChat: () => {

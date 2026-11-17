@@ -22,6 +22,10 @@ include_directories(${NATIVERENDER_ROOT_PATH}
 # wa_bridge.cpp exposes it to ArkTS; it is only compiled+linked once the Rust
 # .so exists, so the app keeps building without it.
 set(WA_ENGINE_LIB "${CMAKE_CURRENT_SOURCE_DIR}/../../../../engine/target/aarch64-unknown-linux-ohos/release/libwa_engine.so")
+if(NOT EXISTS "${WA_ENGINE_LIB}")
+    # CI/prebuilt artifact may be dropped directly into the module libs.
+    set(WA_ENGINE_LIB "${CMAKE_CURRENT_SOURCE_DIR}/../../../libs/arm64-v8a/libwa_engine.so")
+endif()
 if(EXISTS "${WA_ENGINE_LIB}" AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     add_library(call_media SHARED
         video_encoder.cpp

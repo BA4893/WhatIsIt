@@ -29,6 +29,37 @@ export class MediaDownloader {
   }
 
   /**
+   * Persist a data: URL produced by the WebView bridge into the sandbox cache.
+   * Returns a file:// path, or the original data URL when persistence fails.
+   */
+  async saveDataUrl(dataUrl: string, ext: string): Promise<string> {
+    if (!dataUrl.startsWith('data:')) {
+      return dataUrl;
+    }
+    if (this.cacheDir.length === 0) {
+      return dataUrl;
+    }
+    try {
+      const comma = dataUrl.indexOf(',');
+      if (comma < 0) {
+        return dataUrl;
+      }
+      const bytes = new util.Base64Helper().decodeSync(dataUrl.substring(comma + 1));
+      const dest = this.cacheDir + '/wa-media-' + util.generateRandomUUID() + (ext.length > 0 ? '.' + ext : '');
+      const file = fileIo.openSync(dest, fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE);
+      try {
+        fileIo.writeSync(file.fd, bytes.buffer);
+      } finally {
+        fileIo.closeSync(file);
+      }
+      return 'file://' + dest;
+    } catch (err) {
+      hilog.warn(DOMAIN, TAG, 'saveDataUrl failed: %{public}s', JSON.stringify(err));
+      return dataUrl;
+    }
+  }
+
+  /**
    * Download a media URL into the sandbox cache and return a local
    * file:// path suitable for native Image/Video. Returns '' on failure.
    * `cookies` is ignored (the backend serves media with the same auth as
